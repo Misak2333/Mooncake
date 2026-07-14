@@ -1818,6 +1818,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
     auto& metadata = metadata_it->second;
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     auto erased_replicas = PopReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
@@ -1881,6 +1882,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         if (settle_result && metadata.AllReplicas(&Replica::fn_is_completed)) {
             tenant_state.processing_keys.erase(durable_entry.object_key);
         }
+        SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
+                          previous_kv_media);
     }
 }
 
@@ -2099,6 +2102,14 @@ MasterService::EraseMetadata(
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
+
+    // Preserve the event context while a size-changing upsert replaces the
+    // metadata. All other erasures release the object from the indexer.
+    if (quota_mode == QuotaEraseMode::kPreserveOld) {
+        SyncKvObjectState(key, metadata, tenant_id);
+    } else {
+        PublishKvRemoved(key, metadata, tenant_id);
+    }
 
     // Clean up offloading_task + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
@@ -4635,6 +4646,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             std::vector<Replica>{});
     }
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
@@ -4690,6 +4702,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
         SyncCacheTotalAccounting(metadata);
+        SyncKvObjectState(key, metadata, object_id.tenant_id,
+                          previous_kv_media);
         return true;
     }
 
@@ -4710,6 +4724,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     .get_local_disk_descriptor()
                     .object_size;
         });
+    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     return false;
 }
 
@@ -4726,6 +4741,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.client_id;
@@ -4824,6 +4840,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         accessor.Erase();
         return {};
     }
+
+    SyncKvObjectState(key, metadata, object_id.tenant_id,
+                      previous_kv_media);
 
     auto settle_result =
         SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
@@ -5158,6 +5177,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // hard_pinned is const and preserved automatically — upsert
                     // does not change the eviction protection level of an
                     // existing object.
+                    const auto previous_kv_media =
+                        KvMediaForMetadata(metadata);
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
                     if (config.dfs_replica_num > 0 ||
@@ -5201,6 +5222,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.BeginSoftPinAction(
                         *soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
+                    SyncKvObjectState(key, metadata, object_id.tenant_id,
+                                      previous_kv_media);
 
                     tenant_state.processing_keys.insert(key);
 
@@ -5275,6 +5298,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     *soft_pin_request, quota_deficit_bytes,
                     std::move(committed_soft_pin_timeout));
                 if (!allocate_result) {
+                    if (kv_event_publisher_ && kv_event_publisher_->enabled()) {
+                        kv_event_publisher_->PublishObjectRemoved(
+                            key, object_id.tenant_id.value(), existing_group_id);
+                    }
                     if (has_replacement_charge) {
                         auto rollback_result =
                             replacement_charge.ReleaseReplacement(
@@ -5437,6 +5464,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
 
     if (replica_type != ReplicaType::DISK &&
         replica_type != ReplicaType::LOCAL_DISK) {
@@ -5530,8 +5558,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         }
     }
 
+    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (!metadata.IsValid()) {
-        PublishKvRemoved(key, metadata, object_id.tenant_id);
         accessor.Erase();
     }
     return {};
@@ -5782,6 +5810,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -5806,6 +5835,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                            task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
         ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+        SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
             accessor.Erase();
@@ -5910,6 +5940,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 
     accessor.EraseReplicationTask();
 
+    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
+
     return all_complete ? tl::expected<void, ErrorCode>()
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
 }
@@ -5955,6 +5987,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     const auto source_id = task.source_id;
     const auto replica_ids = task.replica_ids;
     auto source = metadata.GetReplicaByID(source_id);
@@ -5978,6 +6011,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
     ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     if (!metadata.IsValid()) {
         // Remove the object if it does not have any replicas.
@@ -6142,6 +6176,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -6165,6 +6200,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                            task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
+        SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
             accessor.Erase();
@@ -6197,6 +6233,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                 task.pending_quota_charge_bytes);
             accessor.EraseReplicationTask();
+            SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
     }
@@ -6299,6 +6336,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 
     accessor.EraseReplicationTask();
 
+    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
+
     return {};
 }
 
@@ -6331,6 +6370,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr) {
@@ -6352,6 +6392,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
+
+    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     if (!metadata.IsValid()) {
         // Remove the object if it does not have any replicas.
@@ -6420,7 +6462,6 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
             return {};
         }
     }
-    PublishKvRemoved(key, metadata, object_id.tenant_id);
     accessor.Erase();
     return {};
 }
@@ -6537,6 +6578,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
+    std::unordered_set<TenantId, TenantIdHash> tenants_seen;
+    std::unordered_set<TenantId, TenantIdHash> tenants_with_remaining_objects;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
@@ -6550,6 +6593,7 @@ long MasterService::RemoveAll(bool force) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
              tenant_it != shard->tenants.end();) {
+            tenants_seen.insert(tenant_it->first);
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
@@ -6605,11 +6649,20 @@ long MasterService::RemoveAll(bool force) {
                     ++it;
                 }
             }
+            if (!tenant_state.metadata.empty()) {
+                tenants_with_remaining_objects.insert(tenant_it->first);
+            }
             if (tenant_state.Empty()) {
                 tenant_it = shard->tenants.erase(tenant_it);
             } else {
                 ++tenant_it;
             }
+        }
+    }
+
+    for (const auto& tenant_id : tenants_seen) {
+        if (!tenants_with_remaining_objects.contains(tenant_id)) {
+            PublishKvCleared(tenant_id);
         }
     }
 
@@ -6625,6 +6678,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    bool has_remaining_objects = false;
 
     // For the tenant-scoped overload, only signal clients that own LOCAL_DISK
     // replicas of THIS tenant — clearing all clients would cross-delete other
@@ -6696,6 +6750,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 ++it;
             }
         }
+        has_remaining_objects = has_remaining_objects ||
+                               !tenant_state.metadata.empty();
         if (tenant_state.Empty()) {
             shard->tenants.erase(tenant_it);
         }
@@ -6703,6 +6759,10 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
 
     local_ssd_manager_.RequestRemoveAll(std::vector<UUID>(
         clients_with_disk_replicas.begin(), clients_with_disk_replicas.end()));
+
+    if (!has_remaining_objects) {
+        PublishKvCleared(normalized_tenant);
+    }
 
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant.value()
@@ -6897,6 +6957,7 @@ bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
     MetadataShardAccessorRW* shard) {
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -6929,6 +6990,9 @@ bool MasterService::CleanupStaleHandles(
         })) {
         shard->OnDiskReplicaRemoved(had_completed_disk, metadata);
     }
+
+    SyncKvObjectState(metadata.user_key, metadata, metadata.tenant_id,
+                      previous_kv_media);
 
     // Return true if no valid replicas remain after cleanup
     return !metadata.IsValid();
@@ -7288,6 +7352,8 @@ auto MasterService::NotifyOffloadSuccess(
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
+                const auto previous_kv_media =
+                    KvMediaForMetadata(obj_metadata);
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
@@ -7341,6 +7407,9 @@ auto MasterService::NotifyOffloadSuccess(
                                         .object_size;
                             });
                     }
+                    SyncKvObjectState(request_object_id.user_key, obj_metadata,
+                                      request_object_id.tenant_id,
+                                      previous_kv_media);
                     handled_existing_object = true;
                 }
             }
@@ -8665,6 +8734,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
+    const auto previous_kv_media = KvMediaForMetadata(metadata);
     auto& tenant_state = accessor.GetTenantState();
 
     // Look up the in-flight task to find the exact replica we staged. A
@@ -8774,6 +8844,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
+    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     return {};
 }
 
@@ -12595,45 +12666,56 @@ KvEventConfig MasterService::BuildKvEventConfig(
     return kv_config;
 }
 
-std::string MasterService::MediumForReplicaType(ReplicaType replica_type) {
-    switch (replica_type) {
-        case ReplicaType::MEMORY:
-            return "cpu";
-        case ReplicaType::DISK:
-        case ReplicaType::LOCAL_DISK:
-        case ReplicaType::NOF_SSD:
-            return "disk";
-        case ReplicaType::ALL:
-        default:
-            return "cpu";
+std::vector<std::string> MasterService::KvMediaForMetadata(
+    const ObjectMetadata& metadata) {
+    bool has_cpu = false;
+    bool has_disk = false;
+    metadata.VisitReplicas(
+        [](const Replica& replica) { return replica.is_completed(); },
+        [&](const Replica& replica) {
+            if (replica.is_memory_replica() &&
+                !replica.has_invalid_mem_handle()) {
+                has_cpu = true;
+            } else if (replica.is_nof_replica() &&
+                       !replica.has_invalid_nof_handle()) {
+                has_disk = true;
+            } else if (replica.is_disk_replica() ||
+                       replica.is_local_disk_replica()) {
+                has_disk = true;
+            }
+        });
+    std::vector<std::string> media;
+    if (has_cpu) {
+        media.emplace_back("cpu");
     }
-}
-
-std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
-    if (metadata.HasMemReplica()) {
-        return "cpu";
+    if (has_disk) {
+        media.emplace_back("disk");
     }
-    if (metadata.HasReplica(&Replica::fn_is_nof_replica) ||
-        metadata.HasReplica(&Replica::fn_is_disk_replica) ||
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
-        return "disk";
-    }
-    return "cpu";
+    return media;
 }
 
 void MasterService::PublishKvStored(const std::string& key,
                                     ReplicaType replica_type,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id) {
+    (void)replica_type;
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    std::string medium = MediumForReplicaType(replica_type);
-    if (replica_type == ReplicaType::ALL) {
-        medium = MediumForMetadata(metadata);
+    kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
+                                          tenant_id.value(), metadata.group_id);
+}
+
+void MasterService::SyncKvObjectState(
+    const std::string& key, const ObjectMetadata& metadata,
+    const TenantId& tenant_id,
+    const std::vector<std::string>& previous_media_hint) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
     }
-    kv_event_publisher_->PublishStored(key, medium, tenant_id,
-                                       metadata.group_id);
+    kv_event_publisher_->SyncObjectState(
+        key, KvMediaForMetadata(metadata), tenant_id.value(),
+        metadata.group_id, previous_media_hint);
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
@@ -12649,8 +12731,11 @@ void MasterService::PublishKvRemoved(const std::string& key,
 void MasterService::PublishKvRemoved(const std::string& key,
                                      const ObjectMetadata& metadata,
                                      const TenantId& tenant_id) {
-    PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id,
-                     metadata.group_id);
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    kv_event_publisher_->PublishObjectRemoved(
+        key, tenant_id.value(), metadata.group_id, KvMediaForMetadata(metadata));
 }
 
 void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
@@ -12658,14 +12743,25 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
                                                const std::string& medium,
                                                const ObjectMetadata& metadata,
                                                const TenantId& tenant_id) {
-    (void)freed_bytes;
-    (void)medium;
+    if (freed_bytes == 0) {
+        return;
+    }
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    if (!metadata.IsValid()) {
-        PublishKvRemoved(key, metadata, tenant_id);
+    auto previous_media = KvMediaForMetadata(metadata);
+    if (std::find(previous_media.begin(), previous_media.end(), medium) ==
+        previous_media.end()) {
+        previous_media.push_back(medium);
     }
+    SyncKvObjectState(key, metadata, tenant_id, previous_media);
+}
+
+void MasterService::PublishKvCleared(const TenantId& tenant_id) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    kv_event_publisher_->PublishCleared(tenant_id.value());
 }
 
 bool MasterService::KvEventsEnabled() const {

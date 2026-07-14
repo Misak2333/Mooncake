@@ -2685,11 +2685,15 @@ class MasterService {
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
-    static std::string MediumForReplicaType(ReplicaType replica_type);
-    static std::string MediumForMetadata(const ObjectMetadata& metadata);
+    static std::vector<std::string> KvMediaForMetadata(
+        const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
                          const ObjectMetadata& metadata,
                          const TenantId& tenant_id);
+    void SyncKvObjectState(
+        const std::string& key, const ObjectMetadata& metadata,
+        const TenantId& tenant_id,
+        const std::vector<std::string>& previous_media_hint = {});
     void PublishKvRemoved(const std::string& key,
                           const ObjectMetadata& metadata,
                           const TenantId& tenant_id);
@@ -2701,6 +2705,7 @@ class MasterService {
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id);
+    void PublishKvCleared(const TenantId& tenant_id);
 
     // OpLog publishing
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
