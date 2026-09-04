@@ -293,6 +293,14 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
 
+To build only the Conductor target from a configured build tree, enable the
+component and build `mooncake_conductor`:
+
+```bash
+cmake -S . -B build -DWITH_CONDUCTOR=ON
+cmake --build build --target mooncake_conductor
+```
+
 ### Build Behavior Options
 
 | Option | Default | Description |
