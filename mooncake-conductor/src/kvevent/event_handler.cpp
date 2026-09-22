@@ -309,6 +309,26 @@ std::string KVEventHandler::HandleBatch(const zmq::DecodedBatch& batch,
     return HandleMooncakeBatch(*mooncake_batch, metadata);
 }
 
+void KVEventHandler::OnSourceStale(const std::string& cache_pool_key,
+                                   const zmq::MessageMetadata& metadata,
+                                   const std::string& reason) {
+    // ZMQClient::MarkStale() already reported why the source went stale, so
+    // only the retraction this handler performs is logged here.
+    // InvalidateEndpoint() stops admitting callbacks before it retracts the
+    // index entries, and it runs on the source's own event loop between
+    // dispatches, so no batch of ours is in flight while the index is mutated.
+    if (std::string error = InvalidateEndpoint(); !error.empty()) {
+        LOG(ERROR) << "Failed to retract stale source service_key="
+                   << cache_pool_key << " endpoint=" << service_.endpoint
+                   << " error=" << error;
+    } else {
+        LOG(WARNING) << "Retracted stale source service_key=" << cache_pool_key
+                     << " endpoint=" << service_.endpoint
+                     << " last_sequence=" << metadata.sequence
+                     << " reason=" << reason;
+    }
+}
+
 std::string KVEventHandler::HandleVllmBatch(
     const zmq::VllmEventBatch& batch, const zmq::MessageMetadata& metadata) {
     if (batch.data_parallel_rank.has_value() &&

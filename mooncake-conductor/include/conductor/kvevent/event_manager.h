@@ -37,6 +37,13 @@ class KVEventHandler : public zmq::EventHandler {
     std::string HandleBatch(const zmq::DecodedBatch& batch,
                             const zmq::MessageMetadata& metadata) override;
 
+    // The source cannot be recovered to a gap-free sequence, so everything it
+    // contributed is retracted: the handler stops admitting batches and
+    // invalidates its index entries until a full resynchronization arrives.
+    void OnSourceStale(const std::string& cache_pool_key,
+                       const zmq::MessageMetadata& metadata,
+                       const std::string& reason) override;
+
     void MarkUnavailable();
 
     // Waits for callbacks admitted before MarkUnavailable() to finish. Must be
