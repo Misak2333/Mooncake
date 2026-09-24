@@ -13,6 +13,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -1752,8 +1753,9 @@ class LevelSink : public google::LogSink {
     }
     ~LevelSink() override { google::RemoveLogSink(this); }
 
+    // Older glog requires this overload; newer releases forward to it.
     void send(google::LogSeverity severity, const char*, const char*, int,
-              const google::LogMessageTime&, const char* message,
+              const std::tm*, const char* message,
               size_t message_len) override {
         if (severity != level_) {
             return;
