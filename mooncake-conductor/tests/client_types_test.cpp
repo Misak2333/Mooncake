@@ -6,7 +6,7 @@ namespace mooncake::conductor {
 namespace {
 
 TEST(ClientTypesTest, ErrorCodeValuesAlignWithStore) {
-    // Values must match mooncake-store/include/types.h where meanings overlap.
+    // Values must match mooncake-store/include/types.h where meaning overlap.
     EXPECT_EQ(static_cast<int32_t>(ErrorCode::OK), 0);
     EXPECT_EQ(static_cast<int32_t>(ErrorCode::INTERNAL_ERROR), -1);
     EXPECT_EQ(static_cast<int32_t>(ErrorCode::INVALID_PARAMS), -600);
