@@ -332,6 +332,16 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i].native = cq;
     }
 
+    native_notify_enabled_ = globalConfig().rdma_notify_enabled &&
+                             std::string(engine_.getName()) == "rdma";
+    if (native_notify_enabled_) {
+        notify_cq_ = ibv_create_cq(context_, globalConfig().max_cqe, nullptr,
+                                   nullptr, 0);
+        if (!notify_cq_) {
+            PLOG(ERROR) << "Failed to create notification completion queue";
+            return ERR_CONTEXT;
+        }
+    }
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
 #ifdef USE_MLX5DV
@@ -350,6 +360,45 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 #endif
 
     return 0;
+}
+
+void RdmaContext::registerNotifyQp(
+    uint32_t qp_num, const std::weak_ptr<RdmaEndPoint> &endpoint) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    notify_endpoints_[qp_num] = endpoint;
+}
+
+void RdmaContext::unregisterNotifyQp(uint32_t qp_num) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    notify_endpoints_.erase(qp_num);
+}
+
+void RdmaContext::dispatchNotificationCompletion(
+    const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received) {
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    {
+        std::lock_guard<std::mutex> guard(notify_mutex_);
+        auto it = notify_endpoints_.find(wc.qp_num);
+        if (it != notify_endpoints_.end()) endpoint = it->second.lock();
+    }
+    // Never acquire endpoint locks under notify_mutex_. Teardown takes them
+    // in the opposite direction. The strong reference protects this callback.
+    if (endpoint) endpoint->handleNotificationCompletion(wc, received);
+}
+
+int RdmaContext::pollNotificationCq() {
+    if (!notify_cq_) return 0;
+    ibv_wc completions[32];
+    const int count = ibv_poll_cq(notify_cq_, 32, completions);
+    if (count < 0) {
+        PLOG(ERROR) << "Failed to poll notification completion queue";
+        return count;
+    }
+    std::vector<TransferMetadata::NotifyDesc> received;
+    for (int i = 0; i < count; ++i)
+        dispatchNotificationCompletion(completions[i], received);
+    for (const auto &message : received) engine_.meta()->pushNotify(message);
+    return count;
 }
 
 int RdmaContext::socketId() {
@@ -391,6 +440,16 @@ int RdmaContext::deconstruct() {
             LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
         }
     }
+
+    // All endpoint QPs must be destroyed before the shared notification CQ.
+    if (notify_cq_) {
+        if (ibv_destroy_cq(notify_cq_)) {
+            LOG(ERROR) << "Failed to destroy shared notification CQ";
+        } else {
+            notify_cq_ = nullptr;
+        }
+    }
+    notify_endpoints_.clear();
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
@@ -525,8 +584,16 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
         // EINVAL for every buffer larger than one chunk (Mooncake#2511).
         //
-        // When the reported allocation does not cover the range the caller is
-        // about to register, export exactly [addr, addr + length) instead.
+        // The opposite case matters too: when the allocation is LARGER than
+        // the range being registered (a sub-range of one big cudaMalloc, e.g.
+        // each pre-touch block of a KV cache in preTouchMemory(), or several
+        // buffers carved out of one allocation), exporting the whole
+        // allocation makes every ibv_reg_dmabuf_mr() import map the full
+        // allocation through BAR1. N concurrent imports of an N-way split then
+        // exhaust BAR1 and fail with ENOMEM, notably on MIG instances.
+        //
+        // So whenever the reported allocation is not exactly the range the
+        // caller is about to register, export exactly [addr, addr + length).
         // cuMemGetHandleForAddressRange() accepts a range spanning several
         // mappings as long as they are contiguously mapped, which is precisely
         // the expandable-segment layout. The export base is page-aligned so
@@ -535,7 +602,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         CUdeviceptr exportBase = allocBase;
         size_t exportSize = allocSize;
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
-        if (exportOffset + length > allocSize) {
+        if (length > 0 && (exportOffset != 0 || length != allocSize)) {
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
@@ -545,12 +612,13 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                 (exportOffset + length + page - 1) & ~(size_t)(page - 1);
             VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
                     << " (base=" << (uintptr_t)allocBase
-                    << " size=" << allocSize << ") does not cover length "
-                    << length << "; exporting the requested range instead"
-                    << " (base=" << (uintptr_t)exportBase
-                    << " size=" << exportSize
+                    << " size=" << allocSize << ") differs from the " << length
+                    << "-byte range being registered; exporting"
+                    << " the requested range instead (base="
+                    << (uintptr_t)exportBase << " size=" << exportSize
                     << "). Expected for CUDA VMM allocations such as PyTorch"
-                       " expandable_segments.";
+                       " expandable_segments, and for sub-ranges of a larger"
+                       " allocation.";
         }
 
         // Without Data Direct, flags must be 0: the PCIE-BAR1 mapping flag is
