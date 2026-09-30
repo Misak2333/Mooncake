@@ -954,7 +954,7 @@ class SglangHashChain final : public HashChain {
             const size_t block_end =
                 std::min(block_begin + block_size_, logical_length);
             // Size once, then write little-endian bytes directly instead of
-            // updating the vector for each byte of every token.
+            // updating the vectors for each byte of every token.
             encoded_.resize((block_end - block_begin) * (bigram_ ? 8 : 4));
             uint8_t* output = encoded_.data();
             for (size_t token_index = block_begin; token_index < block_end;
