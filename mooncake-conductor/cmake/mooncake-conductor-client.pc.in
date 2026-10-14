@@ -1,0 +1,9 @@
+prefix=@CONDUCTOR_PC_PREFIX@
+libdir=@CONDUCTOR_PC_LIBDIR@
+includedir=@CONDUCTOR_PC_INCLUDEDIR@
+
+Name: mooncake-conductor-client
+Description: Mooncake Conductor RPC client C ABI
+Version: 1.0.0
+Libs: -L${libdir} -lmooncake_conductor_client
+Cflags: -I${includedir}

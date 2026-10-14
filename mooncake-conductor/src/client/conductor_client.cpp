@@ -23,7 +23,14 @@ struct ConductorClient::Impl {
 };
 
 ConductorClient::ConductorClient() : impl_(std::make_unique<Impl>()) {}
-ConductorClient::~ConductorClient() { Close(); }
+ConductorClient::~ConductorClient() {
+    try {
+        Close();
+    } catch (...) {
+        // Destruction must not propagate allocation/executor failures. The
+        // native RPC member still performs its own socket cleanup.
+    }
+}
 
 tl::expected<void, ErrorCode> ConductorClient::Setup(
     const ConductorClientConfig& config) {
@@ -53,10 +60,14 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
 void ConductorClient::Close() {
     std::lock_guard lock(impl_->mu);
     impl_->connected = false;
-    // ylt 0.5.7 client.close() uses close_socket_async: a CAS keeps it
-    // idempotent, the socket closes asynchronously without blocking, and
-    // connect_impl resets has_closed_, so Setup() after Close() reconnects.
+    // ylt close() dispatches socket cleanup asynchronously. Drain that work
+    // before releasing the client: short-lived C/Go callers may immediately
+    // destroy it and exit, racing the global executor's teardown otherwise.
     impl_->client.close();
+    auto executor = impl_->client.get_executor().get_asio_executor();
+    if (!executor.running_in_this_thread()) {
+        async_simple::coro::syncAwait(coro_io::post([] {}, executor));
+    }
 }
 
 bool ConductorClient::HealthCheck() {
