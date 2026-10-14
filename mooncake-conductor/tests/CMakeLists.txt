@@ -48,14 +48,4 @@ if(TARGET mooncake_conductor_client)
   set_tests_properties(conductor_c_lifecycle_test PROPERTIES TIMEOUT 30)
   target_sources(conductor_test PRIVATE conductor_c_test.cpp)
   target_link_libraries(conductor_test PRIVATE mooncake_conductor_client)
-  find_program(CONDUCTOR_PKG_CONFIG_EXECUTABLE NAMES pkg-config pkgconf)
-  if(CONDUCTOR_PKG_CONFIG_EXECUTABLE)
-    add_test(
-      NAME conductor_pkgconfig_layout_test
-      COMMAND
-        ${CMAKE_COMMAND}
-        "-DPKG_CONFIG_EXECUTABLE=${CONDUCTOR_PKG_CONFIG_EXECUTABLE}"
-        "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-layout" -P
-        ${CMAKE_CURRENT_SOURCE_DIR}/pkgconfig_layout_test.cmake)
-  endif()
 endif()

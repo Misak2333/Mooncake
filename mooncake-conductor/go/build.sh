@@ -7,7 +7,11 @@ if [ "$#" -ne 2 ]; then
 fi
 conductor_build=$(cd "$1" && pwd)
 output_binary=$2
-export PKG_CONFIG_PATH="$conductor_build/pkgconfig-build${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Match Store's cgo build: provide native header and library paths explicitly.
+export CGO_CFLAGS="-I${script_dir}/../include${CGO_CFLAGS:+ $CGO_CFLAGS}"
+export CGO_LDFLAGS="-L${conductor_build} -lmooncake_conductor_client${CGO_LDFLAGS:+ $CGO_LDFLAGS}"
 export CGO_ENABLED=1
-cd "$(dirname "$0")"
+cd "$script_dir"
 "${GO:-go}" build -o "$output_binary" ./examples/basic

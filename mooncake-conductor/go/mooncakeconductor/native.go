@@ -3,7 +3,6 @@
 package mooncakeconductor
 
 /*
-#cgo pkg-config: mooncake-conductor-client
 #include <stdlib.h>
 #include <conductor/client/conductor_c.h>
 */
