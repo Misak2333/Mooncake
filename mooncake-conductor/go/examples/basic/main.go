@@ -15,21 +15,28 @@ func main() {
 	model := flag.String("model", "model", "registered model name")
 	block := flag.Int64("block-size", 16, "registered prefix block size")
 	flag.Parse()
+	if err := run(*addr, *model, *block); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(addr, model string, block int64) error {
 	client, err := conductor.New()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer client.Close()
-	if err = client.Setup(conductor.ClientConfig{Address: *addr}); err != nil {
-		log.Fatal(err)
+	if err = client.Setup(conductor.ClientConfig{Address: addr}); err != nil {
+		return err
 	}
-	result, err := client.Query(conductor.QueryRequest{ModelName: *model, BlockSize: *block, TokenIDs: []int32{1, 2, 3}})
+	result, err := client.Query(conductor.QueryRequest{ModelName: model, BlockSize: block, TokenIDs: []int32{1, 2, 3}})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	data, err := json.Marshal(result)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fmt.Println(string(data))
+	return nil
 }

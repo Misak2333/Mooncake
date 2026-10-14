@@ -158,13 +158,13 @@ if(WITH_CONDUCTOR_C_SHARED OR WITH_CONDUCTOR_GO)
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
   install(FILES include/conductor/client/conductor_c.h
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/conductor/client)
-  # Keep the installed pkg-config file relocatable, including --install
-  # --prefix.
-  set(CONDUCTOR_PC_PREFIX "\${pcfiledir}/../..")
-  set(CONDUCTOR_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
-  set(CONDUCTOR_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
-  configure_file(cmake/mooncake-conductor-client.pc.in
-                 pkgconfig/mooncake-conductor-client.pc @ONLY)
+  # Keep the installed pkg-config file relocatable, including --install --prefix
+  # and multiarch libdir layouts.
+  include(cmake/ConductorPkgConfig.cmake)
+  conductor_configure_pkg_config_file(
+    cmake/mooncake-conductor-client.pc.in
+    pkgconfig/mooncake-conductor-client.pc "${CMAKE_INSTALL_LIBDIR}"
+    "${CMAKE_INSTALL_INCLUDEDIR}")
   install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/pkgconfig/mooncake-conductor-client.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

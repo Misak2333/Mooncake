@@ -9,5 +9,8 @@ int main(void) {
     if (mooncake_conductor_create(&client) != MOONCAKE_CONDUCTOR_OK) return 2;
     if (mooncake_conductor_health_check(client, &status) != 0 || status != 1)
         return 3;
+    if (mooncake_conductor_close(client) != 0 ||
+        mooncake_conductor_close(client) != 0)
+        return 4;
     return mooncake_conductor_destroy(client) != 0;
 }

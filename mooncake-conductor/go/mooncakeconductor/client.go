@@ -43,17 +43,19 @@ func timeoutMillis(value, fallback time.Duration) (int64, error) {
 func (c *Client) Setup(config ClientConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.native != nil {
-		if err := c.native.disconnect(); err != nil {
-			return err
-		}
-	}
 	connect, err := timeoutMillis(config.ConnectTimeout, time.Second)
-	if err != nil {
-		return err
+	var request int64
+	if err == nil {
+		request, err = timeoutMillis(config.RequestTimeout, 3*time.Second)
 	}
-	request, err := timeoutMillis(config.RequestTimeout, 3*time.Second)
 	if err != nil {
+		// Native Setup closes the old connection on valid Go input. Validation
+		// failures must also leave the previous connection unavailable.
+		if c.native != nil {
+			if closeErr := c.native.disconnect(); closeErr != nil {
+				return closeErr
+			}
+		}
 		return err
 	}
 	if c.native == nil {

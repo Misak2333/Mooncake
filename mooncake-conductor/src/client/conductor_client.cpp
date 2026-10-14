@@ -20,6 +20,21 @@ struct ConductorClient::Impl {
     std::mutex mu;  // serializes calls; see header's thread-safety note
     int64_t request_timeout_ms = 3000;
     bool connected = false;
+    bool cleanup_drained = false;
+
+    // Caller holds mu. Only a new connection attempt invalidates this state.
+    void Close() {
+        connected = false;
+        if (cleanup_drained) return;
+        // ylt close() dispatches socket cleanup asynchronously. Complete it
+        // before short-lived callers release the client and exit.
+        client.close();
+        auto executor = client.get_executor().get_asio_executor();
+        if (!executor.running_in_this_thread()) {
+            async_simple::coro::syncAwait(coro_io::post([] {}, executor));
+        }
+        cleanup_drained = true;
+    }
 };
 
 ConductorClient::ConductorClient() : impl_(std::make_unique<Impl>()) {}
@@ -37,8 +52,7 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     std::lock_guard lock(impl_->mu);
     // Every setup attempt replaces the previous connection, even if the new
     // address is invalid or the connection fails.
-    impl_->connected = false;
-    impl_->client.close();
+    impl_->Close();
     impl_->request_timeout_ms = config.request_timeout_ms;
     // Split "host:port" for coro_rpc_client::connect(host, port).
     const auto colon = config.conductor_addr.rfind(':');
@@ -47,10 +61,11 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     }
     const std::string host = config.conductor_addr.substr(0, colon);
     const std::string port = config.conductor_addr.substr(colon + 1);
+    impl_->cleanup_drained = false;
     auto ec = async_simple::coro::syncAwait(impl_->client.connect(
         host, port, std::chrono::milliseconds(config.connect_timeout_ms)));
     if (ec) {
-        impl_->client.close();
+        impl_->Close();
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
     impl_->connected = true;
@@ -59,15 +74,7 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
 
 void ConductorClient::Close() {
     std::lock_guard lock(impl_->mu);
-    impl_->connected = false;
-    // ylt close() dispatches socket cleanup asynchronously. Drain that work
-    // before releasing the client: short-lived C/Go callers may immediately
-    // destroy it and exit, racing the global executor's teardown otherwise.
-    impl_->client.close();
-    auto executor = impl_->client.get_executor().get_asio_executor();
-    if (!executor.running_in_this_thread()) {
-        async_simple::coro::syncAwait(coro_io::post([] {}, executor));
-    }
+    impl_->Close();
 }
 
 bool ConductorClient::HealthCheck() {

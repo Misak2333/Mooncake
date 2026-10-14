@@ -202,8 +202,17 @@ func TestEventsToGoQuery(t *testing.T) {
 	if err = c.Setup(conductor.ClientConfig{Address: addr}); err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []conductor.ClientConfig{{Address: "invalid"}, {Address: addr, RequestTimeout: -1}} {
-		if err = c.Setup(bad); !errors.Is(err, &conductor.Error{Code: conductor.InvalidParams}) {
+	for _, tc := range []struct {
+		config conductor.ClientConfig
+		code   conductor.ErrorCode
+	}{
+		{conductor.ClientConfig{Address: "invalid"}, conductor.InvalidParams},
+		{conductor.ClientConfig{Address: addr, ConnectTimeout: -1}, conductor.InvalidParams},
+		{conductor.ClientConfig{Address: addr, RequestTimeout: -1}, conductor.InvalidParams},
+		{conductor.ClientConfig{Address: addr, RequestTimeout: time.Duration(1<<63 - 1)}, conductor.InvalidParams},
+		{conductor.ClientConfig{Address: "127.0.0.1:0"}, conductor.RPCFail},
+	} {
+		if err = c.Setup(tc.config); !errors.Is(err, &conductor.Error{Code: tc.code}) {
 			t.Fatal(err)
 		}
 		if status, e := c.HealthCheck(); status != conductor.NotInitialized || e != nil {
