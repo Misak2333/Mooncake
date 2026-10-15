@@ -61,5 +61,27 @@ TEST(ClientLivenessConfigTest, LegacyBuilderSetterDefaultsBothWindows) {
     EXPECT_EQ(config.client_suspicion_ttl_sec, 45);
 }
 
+TEST(KvEventConfigTest, PreservesUcsSettingsThroughMasterConfigCopies) {
+    MasterConfig master{};
+    master.enable_kv_events = true;
+    master.kv_events_wire_format = "ucs";
+    master.kv_events_topic = "mooncake";
+    master.kv_events_replay_endpoint = "tcp://127.0.0.1:19998";
+    master.kv_events_replay_buffer_capacity = 17;
+    WrappedMasterServiceConfig wrapped(master, ViewVersionId{});
+    MasterServiceConfig service(wrapped);
+    EXPECT_TRUE(service.enable_kv_events);
+    EXPECT_EQ(service.kv_events_wire_format, "ucs");
+    EXPECT_EQ(service.kv_events_topic, "mooncake");
+    EXPECT_EQ(service.kv_events_replay_endpoint,
+              master.kv_events_replay_endpoint);
+    EXPECT_EQ(service.kv_events_replay_buffer_capacity, 17u);
+    MasterServiceSupervisorConfig supervisor(master);
+    WrappedMasterServiceConfig supervised(supervisor, ViewVersionId{});
+    MasterServiceConfig supervised_service(supervised);
+    EXPECT_EQ(supervised_service.kv_events_wire_format, "ucs");
+    EXPECT_EQ(supervised_service.kv_events_replay_buffer_capacity, 17u);
+}
+
 }  // namespace
 }  // namespace mooncake::test

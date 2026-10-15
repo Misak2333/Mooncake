@@ -14,6 +14,7 @@
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "replica_selection.h"
 #include "common/client_buffer_allocation.h"
 #include "uds_transport.h"
 #include "common/result.h"
@@ -1963,11 +1964,30 @@ std::vector<int> DummyClient::batch_upsert_from_multi_buffers(
 
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes, bool prefer_same_node) {
+    return batch_get_into_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 prefer_same_node, {});
+}
+
+std::vector<int> DummyClient::batch_get_into_multi_buffers_from_segments(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::string>& source_segments) {
+    return batch_get_into_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 false, source_segments);
+}
+
+std::vector<int> DummyClient::batch_get_into_multi_buffers_internal(
+    const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    const std::vector<std::string>& source_segments) {
     if (keys.size() != all_buffer_ptrs.size() ||
-        keys.size() != all_sizes.size()) {
+        keys.size() != all_sizes.size() ||
+        !ValidateSourceSegments(keys, source_segments)) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
     auto prepared =
@@ -1977,10 +1997,17 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
-                         int64_t>(keys.size(), keys, prepared->dummy_buffers,
-                                  all_sizes, prefer_alloc_in_same_node,
-                                  device_id_, client_id_);
+        source_segments.empty()
+            ? invoke_batch_rpc<
+                  &RealClient::batch_get_into_multi_buffers_dummy_helper,
+                  int64_t>(keys.size(), keys, prepared->dummy_buffers,
+                           all_sizes, prefer_alloc_in_same_node, device_id_,
+                           client_id_)
+            : invoke_batch_rpc<
+                  &RealClient::
+                      batch_get_into_multi_buffers_from_segments_dummy_helper,
+                  int64_t>(keys.size(), keys, prepared->dummy_buffers,
+                           all_sizes, source_segments, device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {

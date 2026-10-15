@@ -5928,6 +5928,42 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
         prefer_alloc_in_same_node);
 }
 
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_multi_buffers_from_segments_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::string> &source_segments, int32_t device_id,
+    const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    auto real_buffers_result = map_dummy_nested_addrs_to_real_ptrs(
+        context, dummy_all_buffers, all_sizes, keys, client_id);
+    if (!real_buffers_result) {
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(real_buffers_result.error()));
+    }
+
+    return batch_get_into_multi_buffers_internal(
+        keys, real_buffers_result.value(), all_sizes, false, source_segments);
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
     size_t src_offset, size_t size, bool size_is_buffer_capacity,
@@ -7705,12 +7741,48 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     return results;
 }
 
+std::vector<int> RealClient::batch_get_into_multi_buffers_from_segments(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::string> &source_segments) {
+    if (!client_) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    auto internal_results =
+        execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
+            [&]() {
+                return batch_get_into_multi_buffers_internal(
+                    keys, all_buffers, all_sizes, false, source_segments);
+            },
+            [](const auto &) { return true; },
+            [&](uint64_t latency_us, const auto &ret) {
+                std::vector<int> py_results;
+                py_results.reserve(ret.size());
+                for (const auto &item : ret) {
+                    py_results.push_back(to_py_ret(item));
+                }
+                client_->ObserveTransferOperation(
+                    TransferOperationKind::kRead,
+                    "batch_get_into_multi_buffers_from_segments",
+                    sum_positive_results(py_results), latency_us);
+            });
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    const std::vector<std::string> &source_segments) {
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -7718,7 +7790,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
+        !ValidateSourceSegments(keys, source_segments)) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << all_buffers.size()
                    << ", sizes=" << all_sizes.size();
@@ -7726,6 +7799,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
+    std::unordered_set<std::string> pinned_source_keys;
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results;
     results.reserve(num_keys);
@@ -7792,13 +7866,25 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
         // any NOF, LOCAL_DISK, DFS, then DISK. Master may return multiple
         // replicas in any order, so always scan.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
-        if (!best_replica) {
-            LOG(ERROR) << "No usable replica for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
+        if (all_buffers[i].size() != all_sizes[i].size()) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        const bool pinned =
+            !source_segments.empty() && !source_segments[i].empty();
+        const auto *best_replica =
+            pinned ? SelectMemoryReplicaFromSegment(
+                         query_result_values.replicas, source_segments[i])
+                   : SelectBestReplica(query_result_values.replicas,
+                                       local_endpoints);
+        if (!best_replica) {
+            LOG(ERROR) << "No usable replica for key: " << key;
+            results.emplace_back(
+                tl::unexpected(pinned ? ErrorCode::REPLICA_NOT_FOUND
+                                      : ErrorCode::INVALID_REPLICA));
+            continue;
+        }
+        if (pinned) pinned_source_keys.insert(key);
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
@@ -7891,7 +7977,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+                              prefer_alloc_in_same_node, pinned_source_keys);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];

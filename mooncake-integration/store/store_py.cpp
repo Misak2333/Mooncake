@@ -3233,6 +3233,20 @@ PYBIND11_MODULE(store, m) {
             "multiple "
             "keys")
         .def(
+            "batch_get_into_multi_buffers_from_segments",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const std::vector<std::string> &source_segments) {
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers_from_segments(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    source_segments);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("source_segments"))
+        .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {

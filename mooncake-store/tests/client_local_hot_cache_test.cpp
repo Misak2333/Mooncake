@@ -1425,6 +1425,57 @@ TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
 // CountMinSketch basic tests
 // ---------------------------------------------------------------------------
 
+TEST_F(LocalHotCacheTest, ExplicitBatchSourceBypassesHotCache) {
+    const char* previous_cache = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const std::optional<std::string> saved_cache =
+        previous_cache ? std::optional<std::string>(previous_cache)
+                       : std::nullopt;
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);
+    auto created = CreateTestClient("localhost");
+    if (saved_cache) {
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", saved_cache->c_str(), 1);
+    } else {
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    }
+    ASSERT_TRUE(created.has_value());
+    auto client = created.value();
+    ASSERT_TRUE(client->IsHotCacheEnabled());
+    const std::string key = "ucs-pinned-hot-cache";
+    std::string stale(64, 's');
+    std::string current(64, 'c');
+    std::string output(64, '0');
+    ASSERT_TRUE(PutHotKeyHelper(*client->GetHotCache(), key,
+                                Slice{stale.data(), stale.size()}));
+    ASSERT_TRUE(client->RegisterLocalMemory(current.data(), current.size(), "*")
+                    .has_value());
+    ASSERT_TRUE(client->RegisterLocalMemory(output.data(), output.size(), "*")
+                    .has_value());
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor descriptor;
+    descriptor.buffer_descriptor.transport_endpoint_ =
+        client->GetTransportEndpoint();
+    descriptor.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(current.data());
+    descriptor.buffer_descriptor.size_ = current.size();
+    descriptor.buffer_descriptor.protocol_ = "tcp";
+    replica.descriptor_variant = descriptor;
+    const QueryResult query(
+        {replica}, std::chrono::steady_clock::now() + std::chrono::seconds(60));
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {key, {{output.data(), output.size()}}}};
+    auto results = client->BatchGet({key}, {query}, slices);
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_EQ(output, stale);
+    results = client->BatchGet({key}, {query}, slices, false, {key});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_EQ(output, current);
+    EXPECT_TRUE(client->unregisterLocalMemory(current.data()).has_value());
+    EXPECT_TRUE(client->unregisterLocalMemory(output.data()).has_value());
+}
+
 TEST_F(LocalHotCacheTest, CountMinSketchBasic) {
     CountMinSketch sketch(64, 4);
 

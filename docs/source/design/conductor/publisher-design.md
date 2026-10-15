@@ -5,7 +5,8 @@
 The master publishes logical cache availability for external indexers while
 keeping physical replica management internal. The implementation uses the
 existing RFC #1527 map protocol and supports `stored`, `removed`, and
-`cleared`. It does not include an indexer, replay service, or Conductor.
+`cleared`. An optional UCS wire format publishes physical replica locations for
+existing UCS consumers. The publisher does not include an indexer or Conductor.
 
 ## Transport
 
@@ -139,12 +140,84 @@ obvious ones: an object whose replicas are not all completed, an object with a
 pending replication task, a failed oplog slot reservation, and a failed oplog
 append.
 
+## UCS compatibility
+
+Build with `ENABLE_KV_EVENTS=ON` and select the UCS format when the subscriber
+expects the original Mooncake UCS array protocol:
+
+```bash
+mooncake_master \
+  --enable_kv_events=true \
+  --kv_events_wire_format=ucs \
+  --kv_events_bind_endpoint='tcp://*:19997' \
+  --kv_events_topic=mooncake \
+  --kv_events_replay_endpoint='tcp://*:19998'
+```
+
+The default `native` format keeps the RFC map protocol described above.
+`kv_events_emit_legacy_compat` adds aliases to those maps; it does not select
+the UCS protocol. UCS requires object keys and single-tenant mode. It does not
+require `backend_id`, model metadata, or changes to the existing UCS decoder.
+
+UCS messages have three frames: topic (`mooncake` by default), big-endian
+64-bit sequence, and msgpack `[timestamp_seconds, events]`. Object events are
+`["BlockUpdateEvent", object_key, replicas]`; each replica is a pair of type
+and location. Supported pairs are `memory` with the transfer endpoint, `disk`
+with the file path, and `local_disk` with the transfer endpoint. DFS and NOF
+replicas are not advertised to the old UCS consumer.
+
+Each update replaces the object's complete location list. A same-tier replica
+change, such as A+B becoming B, therefore emits an update even though memory
+remains available. Only completed, available replicas are advertised. An empty
+list retracts the object. RemoveAll retracts each deleted object individually
+and may additionally emit `["RemoveAllEvent"]`; leased or pinned survivors
+keep their locations.
+
+The old flags `enable_kv_event_publish`, `kv_event_publisher_endpoint`,
+`kv_event_publisher_topic`, and `kv_event_publisher_replay_endpoint` remain
+accepted. Enabling `enable_kv_event_publish` selects UCS format. Conflicting
+explicit old/new settings are rejected. Bind ports are fixed; the publisher
+does not silently choose a port different from the subscriber's configuration.
+
+The optional replay endpoint retains up to `kv_events_replay_buffer_capacity`
+successfully published batches (default 10000). A DEALER requests replay with
+an empty frame and an eight-byte big-endian starting sequence. Replies contain
+an empty frame, sequence and payload; an all-ones sequence and empty payload
+terminate the response. Replay works while the publisher is idle. It cannot
+recover events dropped before publication or batches older than the buffer.
+Current UCS subscribers detect sequence gaps but do not automatically replay.
+
+### Reading from selected segments
+
+The Python Store exposes the existing UCS call:
+
+```python
+results = store.batch_get_into_multi_buffers_from_segments(
+    keys, all_buffer_ptrs, all_sizes, source_segments
+)
+```
+
+The source list is empty or aligned with `keys`. Each nonempty entry requires
+a completed memory replica on that exact transfer endpoint; `tcp://` prefixes
+are optional. An empty entry uses normal replica selection. A missing selected
+replica returns `REPLICA_NOT_FOUND` for that key without choosing another
+replica. Other valid keys can still succeed. Successful results are byte counts;
+failures are negative Store error codes.
+
+Selected reads still query Master metadata and validate leases and destination
+capacity. They bypass local hot-cache redirection so the selected source is
+honored. Reads without a source constraint keep normal cache behavior. Matching
+duplicate key/source pairs share a read and copy to all destinations;
+conflicting source constraints for one key return `INVALID_PARAMS` for the
+whole batch before transfer. RealClient and DummyClient support the same API,
+including DummyClient staging and copy-back. Python releases the GIL during
+the synchronous call; UCS can submit it on its existing background executor.
+
 ## Limitations
 
-The publisher is PUB-only. It does not replay missed events, publish a startup
-snapshot, or persist its compact context cache. Subscribers must detect
-transport sequence gaps and recover through their own reconciliation path.
-Because the compact context is per-process and not persisted, a master restart
-resets it: the first event for a previously known object is a fresh `stored`
-rather than a delta. Objects restored before the publisher starts are only
-described by tenant, backend, fixed publisher context, and object key.
+Without a configured replay endpoint, the publisher is PUB-only. It does not
+publish a startup snapshot or persist queue/replay state. Subscribers must
+detect sequence gaps and reconcile missing state. A master restart resets the
+transport sequence and replay history. Native events for objects restored
+before the publisher starts still describe tenant, backend, fixed publisher
+context, and object key rather than a physical replica inventory.

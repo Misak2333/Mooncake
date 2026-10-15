@@ -28,6 +28,9 @@ class KvEventPublisher {
     KvEventPublisher& operator=(const KvEventPublisher&) = delete;
 
     bool enabled() const { return config_.enabled; }
+    bool ucs_format() const { return config_.wire_format == "ucs"; }
+    void PublishReplicaUpdate(const std::string& object_key,
+                              std::vector<KvReplicaLocation> replicas);
 
     // Non-blocking enqueue into a bounded queue; drops oldest when full.
     // The string overloads keep the wire format independent of Store's
@@ -87,7 +90,7 @@ class KvEventPublisher {
     Stats GetStats() const;
 
    private:
-    enum class EventKind { kStored, kRemoved, kCleared };
+    enum class EventKind { kStored, kRemoved, kCleared, kReplicaUpdate };
 
     struct PendingEvent {
         EventKind kind;
@@ -95,16 +98,20 @@ class KvEventPublisher {
         std::string medium;
         std::string tenant_id;
         std::string group_id;
+        std::vector<KvReplicaLocation> replicas{};
     };
 
     void EnqueueBatch(std::vector<PendingEvent> events);
     void WorkerLoop();
     void PublishBatch(const std::vector<PendingEvent>& batch);
     void DrainRemainingQueue(std::vector<PendingEvent>& batch);
+    void ServiceReplay();
 
     KvEventConfig config_;
     void* zmq_context_{nullptr};
     void* zmq_socket_{nullptr};
+    void* replay_socket_{nullptr};
+    std::deque<std::pair<uint64_t, std::string>> replay_buffer_;
 
     mutable std::mutex queue_mutex_;
     std::deque<PendingEvent> queue_;
@@ -130,6 +137,9 @@ class KvEventPublisher {
         : config_(std::move(config)) {}
 
     bool enabled() const { return false; }
+    bool ucs_format() const { return false; }
+    void PublishReplicaUpdate(const std::string&,
+                              std::vector<KvReplicaLocation>) {}
 
     void PublishStored(const std::string&, const std::string&,
                        const std::string& = "", const std::string& = "") {}

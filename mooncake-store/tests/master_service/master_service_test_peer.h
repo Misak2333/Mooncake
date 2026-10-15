@@ -409,7 +409,7 @@ class MasterServiceTestPeer {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
-        const std::vector<std::string>& previous_media_hint = {}) {
+        const KvObjectState& previous_media_hint = {}) {
         service_.FinalizeRemovedReplicasAfterDurable(
             durable_entry, replica_ids, quota_mode, previous_media_hint);
     }

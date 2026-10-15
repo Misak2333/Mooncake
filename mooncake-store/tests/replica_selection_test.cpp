@@ -102,6 +102,37 @@ class ReplicaSelectionTest : public ::testing::Test {
     std::optional<std::string> original_env_;
 };
 
+TEST(SourceSegmentTest, SelectsOnlyTheRequestedCompleteMemoryReplica) {
+    std::vector<Replica::Descriptor> replicas{
+        MakeMemory("node-a:1234", "tcp"),
+        MakeMemory("node-b:1234", "rdma", ReplicaStatus::PROCESSING),
+        MakeNoF("node-b:1234"),
+        MakeMemory("node-b:1234", "tcp"),
+    };
+    EXPECT_EQ(SelectMemoryReplicaFromSegment(replicas, "node-b:1234"),
+              &replicas[3]);
+    EXPECT_EQ(SelectMemoryReplicaFromSegment(replicas, "tcp://node-b:1234"),
+              &replicas[3]);
+    EXPECT_EQ(SelectMemoryReplicaFromSegment(replicas, "node-b:9999"), nullptr);
+}
+
+TEST(SourceSegmentTest, NormalizesReplicaAndRequestEndpoints) {
+    std::vector<Replica::Descriptor> replicas{
+        MakeMemory("tcp://node-a:1234", "tcp")};
+    EXPECT_EQ(SelectMemoryReplicaFromSegment(replicas, "node-a:1234"),
+              &replicas[0]);
+}
+
+TEST(SourceSegmentTest, ValidatesBatchShapeAndDuplicateSourceConstraints) {
+    EXPECT_TRUE(ValidateSourceSegments({"a", "b"}, {}));
+    EXPECT_TRUE(ValidateSourceSegments({"a", "b"}, {"node-a:1", ""}));
+    EXPECT_FALSE(ValidateSourceSegments({"a", "b"}, {"node-a:1"}));
+    EXPECT_TRUE(
+        ValidateSourceSegments({"a", "a"}, {"node-a:1", "tcp://node-a:1"}));
+    EXPECT_FALSE(ValidateSourceSegments({"a", "a"}, {"node-a:1", "node-b:1"}));
+    EXPECT_FALSE(ValidateSourceSegments({"a", "a"}, {"node-a:1", ""}));
+}
+
 // --- Base policy (scoring off): behaviour must be unchanged --------------
 
 TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {

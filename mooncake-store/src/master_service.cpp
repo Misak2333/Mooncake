@@ -1694,8 +1694,7 @@ tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
     const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    QuotaEraseMode quota_mode,
-    const std::vector<std::string>& previous_media_hint) {
+    QuotaEraseMode quota_mode, const KvObjectState& previous_media_hint) {
     if (replica_ids.empty()) {
         return;
     }
@@ -1720,8 +1719,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     // completed-replica view no longer contains their media. Preserve the
     // pre-removal view (and any caller-provided snapshot) for the event delta.
     auto previous_media = KvRemovalSnapshot(metadata);
-    previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                          previous_media_hint.end());
+    previous_media.Merge(previous_media_hint);
     auto erased_replicas = PopReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
@@ -2022,8 +2020,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
 MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     TenantState& tenant_state, ObjectMap::iterator it,
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    MetadataShardAccessorRW* shard,
-    const std::vector<std::string>& previous_media_hint) {
+    MetadataShardAccessorRW* shard, const KvObjectState& previous_media_hint) {
     auto& metadata = it->second.metadata;
     auto& state = it->second.state;
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
@@ -2040,8 +2037,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
         // tier, so a medium still visible in metadata must not be dropped
         // from the remove delta.
         auto previous_media = KvRemovalSnapshot(metadata);
-        previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                              previous_media_hint.end());
+        previous_media.Merge(previous_media_hint);
         SyncKvObjectState(key, metadata, tenant_id, previous_media);
     } else {
         PublishKvRemoved(key, metadata, tenant_id, previous_media_hint);
@@ -13386,7 +13382,20 @@ void MasterService::JobDispatchThreadFunc() {
 KvEventConfig MasterService::BuildKvEventConfig(
     const MasterServiceConfig& config) {
     KvEventConfig kv_config;
+    if (config.kv_events_wire_format != "native" &&
+        config.kv_events_wire_format != "ucs") {
+        throw std::invalid_argument(
+            "kv_events_wire_format must be native or ucs");
+    }
+    if (config.enable_kv_events && config.kv_events_wire_format == "ucs" &&
+        config.enable_multi_tenants) {
+        throw std::invalid_argument("UCS KV events require single-tenant mode");
+    }
     kv_config.enabled = config.enable_kv_events;
+    kv_config.wire_format = config.kv_events_wire_format;
+    kv_config.topic = config.kv_events_topic;
+    kv_config.replay_endpoint = config.kv_events_replay_endpoint;
+    kv_config.replay_buffer_capacity = config.kv_events_replay_buffer_capacity;
     kv_config.bind_endpoint = config.kv_events_bind_endpoint;
     kv_config.model_name = config.kv_events_model_name;
     kv_config.backend_id = config.kv_events_backend_id;
@@ -13467,6 +13476,46 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
     return media;
 }
 
+std::vector<KvReplicaLocation> MasterService::KvReplicaLocations(
+    const ObjectMetadata& metadata, bool include_removed,
+    bool include_invalid) {
+    std::vector<KvReplicaLocation> locations;
+    metadata.VisitReplicas(
+        [include_removed](const Replica& replica) {
+            return replica.is_completed() ||
+                   (include_removed &&
+                    (replica.status() == ReplicaStatus::REMOVED ||
+                     replica.status() == ReplicaStatus::PROCESSING));
+        },
+        [&](const Replica& replica) {
+            if (replica.is_memory_replica()) {
+                if (include_invalid && !replica.is_available()) {
+                    locations.emplace_back("memory", "");
+                } else if (replica.is_available()) {
+                    const auto endpoint = replica.transport_endpoint();
+                    if (endpoint && !endpoint->empty()) {
+                        locations.emplace_back("memory", *endpoint);
+                    }
+                }
+            } else if (replica.is_disk_replica()) {
+                locations.emplace_back(
+                    "disk",
+                    replica.get_descriptor().get_disk_descriptor().file_path);
+            } else if (replica.is_local_disk_replica()) {
+                if (include_invalid || replica.is_available()) {
+                    const auto endpoint = replica.transport_endpoint();
+                    if (endpoint && !endpoint->empty()) {
+                        locations.emplace_back("local_disk", *endpoint);
+                    }
+                }
+            }
+        });
+    std::sort(locations.begin(), locations.end());
+    locations.erase(std::unique(locations.begin(), locations.end()),
+                    locations.end());
+    return locations;
+}
+
 void MasterService::PublishKvStored(const std::string& key,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id) {
@@ -13478,14 +13527,19 @@ void MasterService::PublishKvStored(const std::string& key,
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id.value(), metadata.group_id);
+    if (kv_event_publisher_->ucs_format()) {
+        kv_event_publisher_->PublishReplicaUpdate(key,
+                                                  KvReplicaLocations(metadata));
+    } else {
+        kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
+                                              tenant_id.value(),
+                                              metadata.group_id);
+    }
 }
 
 void MasterService::SyncKvObjectState(
     const std::string& key, const ObjectMetadata& metadata,
-    const TenantId& tenant_id,
-    const std::vector<std::string>& previous_media_hint) {
+    const TenantId& tenant_id, const KvObjectState& previous_media_hint) {
     const bool publishing =
         kv_event_publisher_ && kv_event_publisher_->enabled();
     if (!publishing && !kv_track_tenant_epochs_) {
@@ -13501,23 +13555,37 @@ void MasterService::SyncKvObjectState(
     if (!publishing) {
         return;
     }
-    kv_event_publisher_->SyncObjectState(key, current_media, tenant_id.value(),
-                                         metadata.group_id,
-                                         previous_media_hint);
+    if (kv_event_publisher_->ucs_format()) {
+        auto replicas = KvReplicaLocations(metadata);
+        auto previous = previous_media_hint.replicas;
+        std::sort(previous.begin(), previous.end());
+        previous.erase(std::unique(previous.begin(), previous.end()),
+                       previous.end());
+        if (replicas != previous) {
+            kv_event_publisher_->PublishReplicaUpdate(key, std::move(replicas));
+        }
+    } else {
+        kv_event_publisher_->SyncObjectState(
+            key, current_media, tenant_id.value(), metadata.group_id,
+            previous_media_hint.media);
+    }
 }
 
-void MasterService::PublishKvRemoved(
-    const std::string& key, const ObjectMetadata& metadata,
-    const TenantId& tenant_id,
-    const std::vector<std::string>& previous_media_hint) {
+void MasterService::PublishKvRemoved(const std::string& key,
+                                     const ObjectMetadata& metadata,
+                                     const TenantId& tenant_id,
+                                     const KvObjectState& previous_media_hint) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
     auto previous_media = KvRemovalSnapshot(metadata);
-    previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                          previous_media_hint.end());
-    kv_event_publisher_->PublishObjectRemoved(
-        key, tenant_id.value(), metadata.group_id, previous_media);
+    previous_media.Merge(previous_media_hint);
+    if (kv_event_publisher_->ucs_format()) {
+        kv_event_publisher_->PublishReplicaUpdate(key, {});
+    } else {
+        kv_event_publisher_->PublishObjectRemoved(
+            key, tenant_id.value(), metadata.group_id, previous_media.media);
+    }
 }
 
 void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
@@ -13541,12 +13609,19 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
     // The object survives. Feeding the evicted medium in as part of the
     // previous set lets the delta drop it, unless another replica still lives
     // on it.
-    auto previous_media = KvMediaForMetadata(metadata);
+    if (kv_event_publisher_->ucs_format()) {
+        kv_event_publisher_->PublishReplicaUpdate(key,
+                                                  KvReplicaLocations(metadata));
+        return;
+    }
+    KvObjectState previous_state;
+    auto& previous_media = previous_state.media;
+    previous_media = KvMediaForMetadata(metadata);
     if (std::find(previous_media.begin(), previous_media.end(), medium) ==
         previous_media.end()) {
         previous_media.push_back(medium);
     }
-    SyncKvObjectState(key, metadata, tenant_id, previous_media);
+    SyncKvObjectState(key, metadata, tenant_id, previous_state);
 }
 
 void MasterService::PublishKvCleared(const TenantId& tenant_id) {

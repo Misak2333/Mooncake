@@ -305,6 +305,19 @@ DEFINE_bool(kv_events_emit_object_key, true,
 DEFINE_uint32(kv_events_queue_capacity, 65536,
               "Maximum pending KV events; oldest events are dropped when "
               "the queue is full (0 = unbounded)");
+DEFINE_string(kv_events_wire_format, "native",
+              "KV event format: native or ucs");
+DEFINE_string(kv_events_topic, "", "KV event topic; UCS defaults to mooncake");
+DEFINE_string(kv_events_replay_endpoint, "",
+              "Optional ZMQ ROUTER replay endpoint");
+DEFINE_uint32(kv_events_replay_buffer_capacity, 10000,
+              "Maximum retained KV event batches for replay");
+DEFINE_bool(enable_kv_event_publish, false,
+            "Legacy alias enabling UCS-format KV events");
+DEFINE_string(kv_event_publisher_endpoint, "", "Legacy KV event bind endpoint");
+DEFINE_string(kv_event_publisher_topic, "", "Legacy KV event topic");
+DEFINE_string(kv_event_publisher_replay_endpoint, "",
+              "Legacy KV event replay endpoint");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -632,6 +645,17 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("kv_events_queue_capacity",
                              &master_config.kv_events_queue_capacity,
                              FLAGS_kv_events_queue_capacity);
+    default_config.GetString("kv_events_wire_format",
+                             &master_config.kv_events_wire_format,
+                             FLAGS_kv_events_wire_format);
+    default_config.GetString("kv_events_topic", &master_config.kv_events_topic,
+                             FLAGS_kv_events_topic);
+    default_config.GetString("kv_events_replay_endpoint",
+                             &master_config.kv_events_replay_endpoint,
+                             FLAGS_kv_events_replay_endpoint);
+    default_config.GetUInt32("kv_events_replay_buffer_capacity",
+                             &master_config.kv_events_replay_buffer_capacity,
+                             FLAGS_kv_events_replay_buffer_capacity);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -1016,6 +1040,25 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.kv_events_queue_capacity = FLAGS_kv_events_queue_capacity;
     }
+    if (google::GetCommandLineFlagInfo("kv_events_wire_format", &info) &&
+        !info.is_default) {
+        master_config.kv_events_wire_format = FLAGS_kv_events_wire_format;
+    }
+    if (google::GetCommandLineFlagInfo("kv_events_topic", &info) &&
+        !info.is_default) {
+        master_config.kv_events_topic = FLAGS_kv_events_topic;
+    }
+    if (google::GetCommandLineFlagInfo("kv_events_replay_endpoint", &info) &&
+        !info.is_default) {
+        master_config.kv_events_replay_endpoint =
+            FLAGS_kv_events_replay_endpoint;
+    }
+    if (google::GetCommandLineFlagInfo("kv_events_replay_buffer_capacity",
+                                       &info) &&
+        !info.is_default) {
+        master_config.kv_events_replay_buffer_capacity =
+            FLAGS_kv_events_replay_buffer_capacity;
+    }
     // Clamp promotion_admission_threshold into the sketch counter's
     // representable range. The CountMinSketch uses 8-bit saturating
     // counters (max 255) so any threshold beyond that would silently
@@ -1349,6 +1392,63 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     }
 }
 
+void ResolveKvEventAliases(const mooncake::DefaultConfig* file,
+                           mooncake::MasterConfig& config) {
+    const auto specified = [file](const char* name) {
+        google::CommandLineFlagInfo flag;
+        return (google::GetCommandLineFlagInfo(name, &flag) &&
+                !flag.is_default) ||
+               (file && file->Contains(name));
+    };
+    if (specified("enable_kv_event_publish")) {
+        bool legacy_enabled = false;
+        if (file) {
+            file->GetBool("enable_kv_event_publish", &legacy_enabled);
+        }
+        google::CommandLineFlagInfo flag;
+        if (google::GetCommandLineFlagInfo("enable_kv_event_publish", &flag) &&
+            !flag.is_default) {
+            legacy_enabled = FLAGS_enable_kv_event_publish;
+        }
+        if (specified("enable_kv_events") &&
+            config.enable_kv_events != legacy_enabled) {
+            throw std::invalid_argument("Conflicting KV event enable flags");
+        }
+        config.enable_kv_events = legacy_enabled;
+        if (legacy_enabled) {
+            if (specified("kv_events_wire_format") &&
+                config.kv_events_wire_format != "ucs") {
+                throw std::invalid_argument(
+                    "Legacy KV event flag requires ucs format");
+            }
+            config.kv_events_wire_format = "ucs";
+        }
+    }
+    const auto resolve_string = [&](const char* canonical, const char* alias,
+                                    std::string& value) {
+        if (!specified(alias)) return;
+        std::string legacy;
+        if (file) file->GetString(alias, &legacy);
+        google::CommandLineFlagInfo flag;
+        if (google::GetCommandLineFlagInfo(alias, &flag) && !flag.is_default) {
+            legacy = flag.current_value;
+        }
+        if (specified(canonical) && value != legacy) {
+            throw std::invalid_argument(
+                std::string("Conflicting KV event flags: ") + canonical +
+                " and " + alias);
+        }
+        value = std::move(legacy);
+    };
+    resolve_string("kv_events_bind_endpoint", "kv_event_publisher_endpoint",
+                   config.kv_events_bind_endpoint);
+    resolve_string("kv_events_topic", "kv_event_publisher_topic",
+                   config.kv_events_topic);
+    resolve_string("kv_events_replay_endpoint",
+                   "kv_event_publisher_replay_endpoint",
+                   config.kv_events_replay_endpoint);
+}
+
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
@@ -1393,6 +1493,12 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        ResolveKvEventAliases(loaded_default_config, master_config);
+    } catch (const std::invalid_argument& error) {
+        LOG(ERROR) << "Invalid KV event configuration: " << error.what();
+        return 1;
+    }
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());

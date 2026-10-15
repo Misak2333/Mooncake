@@ -96,6 +96,12 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    std::vector<int> batch_get_into_multi_buffers_from_segments(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::string> &source_segments) override;
+
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
 
@@ -215,6 +221,12 @@ class DummyClient : public PyClient {
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
+    std::vector<int> batch_get_into_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node, const std::vector<std::string> &source_segments);
+
     struct PreparedBuffer {
         void *original = nullptr;
         void *dummy = nullptr;

@@ -1668,7 +1668,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    const std::unordered_set<std::string>& pinned_source_keys) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1691,7 +1692,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         return results;
     }
-    if (prefer_alloc_in_same_node) {
+    if (prefer_alloc_in_same_node && pinned_source_keys.empty()) {
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
@@ -1734,7 +1735,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         bool cache_used = false;
-        if (hot_cache_ && replica.is_memory_replica()) {
+        if (hot_cache_ && replica.is_memory_replica() &&
+            !pinned_source_keys.contains(key)) {
             cache_used = RedirectToHotCache(key, replica);
             if (cache_used) {
                 total_cache_hits++;

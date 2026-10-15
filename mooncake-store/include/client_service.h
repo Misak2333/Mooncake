@@ -221,7 +221,9 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        const std::unordered_set<std::string>& pinned_source_keys =
+            std::unordered_set<std::string>{});
 
     /**
      * @brief Stores data with replication

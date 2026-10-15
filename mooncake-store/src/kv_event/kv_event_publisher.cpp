@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstring>
 #include <endian.h>
+#include <limits>
+#include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
@@ -95,12 +97,27 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
     if (!config_.enabled) {
         return;
     }
+    if (config_.wire_format != "native" && !ucs_format()) {
+        throw std::invalid_argument(
+            "kv_events_wire_format must be native or ucs");
+    }
+    if (ucs_format()) {
+        if (!config_.emit_object_key) {
+            throw std::invalid_argument("UCS events require object_key");
+        }
+        if (config_.bind_endpoint.empty()) {
+            config_.bind_endpoint = "tcp://*:19997";
+        }
+        if (config_.topic.empty()) {
+            config_.topic = "mooncake";
+        }
+    }
     if (config_.bind_endpoint.empty()) {
         LOG(ERROR) << "kv_events enabled but bind_endpoint is empty";
         config_.enabled = false;
         return;
     }
-    if (config_.backend_id.empty()) {
+    if (config_.backend_id.empty() && !ucs_format()) {
         LOG(ERROR) << "kv_events enabled but backend_id is empty";
         config_.enabled = false;
         return;
@@ -147,6 +164,26 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
         return;
     }
 
+    if (!config_.replay_endpoint.empty()) {
+        replay_socket_ = zmq_socket(zmq_context_, ZMQ_ROUTER);
+        if (replay_socket_) {
+            zmq_setsockopt(replay_socket_, ZMQ_LINGER, &linger_ms,
+                           sizeof(linger_ms));
+            int mandatory = 1;
+            zmq_setsockopt(replay_socket_, ZMQ_ROUTER_MANDATORY, &mandatory,
+                           sizeof(mandatory));
+        }
+        if (!replay_socket_ ||
+            zmq_bind(replay_socket_, config_.replay_endpoint.c_str()) != 0) {
+            if (replay_socket_) zmq_close(replay_socket_);
+            zmq_close(zmq_socket_);
+            zmq_ctx_destroy(zmq_context_);
+            replay_socket_ = nullptr;
+            zmq_socket_ = nullptr;
+            zmq_context_ = nullptr;
+            throw std::runtime_error("Failed to bind KV event replay endpoint");
+        }
+    }
     worker_ = std::thread(&KvEventPublisher::WorkerLoop, this);
     LOG(INFO) << "kv_events publisher enabled on " << config_.bind_endpoint
               << " backend_id=" << config_.backend_id;
@@ -165,10 +202,23 @@ KvEventPublisher::~KvEventPublisher() {
         zmq_close(zmq_socket_);
         zmq_socket_ = nullptr;
     }
+    if (replay_socket_) {
+        zmq_close(replay_socket_);
+        replay_socket_ = nullptr;
+    }
     if (zmq_context_) {
         zmq_ctx_destroy(zmq_context_);
         zmq_context_ = nullptr;
     }
+}
+
+void KvEventPublisher::PublishReplicaUpdate(
+    const std::string& object_key, std::vector<KvReplicaLocation> replicas) {
+    if (!config_.enabled || !ucs_format()) {
+        return;
+    }
+    EnqueueBatch({PendingEvent{EventKind::kReplicaUpdate, object_key, "",
+                               "default", "", std::move(replicas)}});
 }
 
 void KvEventPublisher::PublishStored(const std::string& object_key,
@@ -333,8 +383,14 @@ void KvEventPublisher::WorkerLoop() {
     while (!stop_.load()) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock,
-                           [this] { return stop_.load() || !queue_.empty(); });
+            const auto ready = [this] {
+                return stop_.load() || !queue_.empty();
+            };
+            if (replay_socket_) {
+                queue_cv_.wait_for(lock, std::chrono::milliseconds(20), ready);
+            } else {
+                queue_cv_.wait(lock, ready);
+            }
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();
@@ -344,13 +400,14 @@ void KvEventPublisher::WorkerLoop() {
             PublishBatch(batch);
             batch.clear();
         }
+        ServiceReplay();
     }
     DrainRemainingQueue(batch);
 }
 
 void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     struct EncodedEvent {
-        PendingEvent pending;
+        const PendingEvent& pending;
         uint64_t event_id{0};
     };
     std::vector<EncodedEvent> encoded;
@@ -373,96 +430,121 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
 
     const int64_t timestamp_ms = CurrentUnixTimeMs();
 
-    packer.pack_array(3);
-    packer.pack(timestamp_ms);
-
-    packer.pack_array(encoded.size());
-    for (const auto& item : encoded) {
-        const bool is_stored = item.pending.kind == EventKind::kStored;
-        const bool is_cleared = item.pending.kind == EventKind::kCleared;
-        const char* rfc_type =
-            is_stored ? "stored" : (is_cleared ? "cleared" : "removed");
-        const char* legacy_type =
-            is_stored ? "BlockStored"
-                      : (is_cleared ? "AllBlocksCleared" : "BlockRemoved");
-        // Every enqueue path normalizes an empty tenant to "default" before
-        // building the PendingEvent, so no re-check is needed here.
-        const std::string& tenant_id = item.pending.tenant_id;
-
-        const size_t map_size = ComputeEventMapSize(
-            is_stored, is_cleared, config_.emit_legacy_compat_fields,
-            config_.emit_object_key);
-
-        packer.pack_map(map_size);
-        packer.pack("event_id");
-        packer.pack(item.event_id);
-        packer.pack("timestamp");
+    if (ucs_format()) {
+        packer.pack_array(2);
+        packer.pack(std::chrono::duration<double>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+        packer.pack_array(encoded.size());
+        for (const auto& item : encoded) {
+            const auto& pending = item.pending;
+            if (pending.kind == EventKind::kCleared) {
+                packer.pack_array(1);
+                packer.pack("RemoveAllEvent");
+            } else {
+                packer.pack_array(3);
+                packer.pack("BlockUpdateEvent");
+                packer.pack(pending.object_key);
+                packer.pack_array(pending.replicas.size());
+                for (const auto& [type, endpoint] : pending.replicas) {
+                    packer.pack_array(2);
+                    packer.pack(type);
+                    packer.pack(endpoint);
+                }
+            }
+        }
+    } else {
+        packer.pack_array(3);
         packer.pack(timestamp_ms);
-        packer.pack("event_type");
-        packer.pack(rfc_type);
-        if (config_.emit_legacy_compat_fields) {
-            packer.pack("type");
-            packer.pack(legacy_type);
-        }
-        packer.pack("model_name");
-        PackOptionalString(packer, config_.model_name);
-        packer.pack("block_size");
-        if (config_.block_size == 0) {
-            packer.pack_nil();
-        } else {
-            packer.pack(config_.block_size);
-        }
-        packer.pack("additional_salt");
-        PackOptionalString(packer, config_.additional_salt);
-        packer.pack("lora_name");
-        PackOptionalString(packer, config_.lora_name);
-        packer.pack("tenant_id");
-        packer.pack(tenant_id);
-        packer.pack("backend_id");
-        packer.pack(config_.backend_id);
-        packer.pack("medium");
-        PackOptionalString(packer, item.pending.medium);
-        packer.pack("dp_rank");
-        packer.pack(config_.dp_rank);
 
-        if (is_cleared) {
-            continue;
-        }
+        packer.pack_array(encoded.size());
+        for (const auto& item : encoded) {
+            const bool is_stored = item.pending.kind == EventKind::kStored;
+            const bool is_cleared = item.pending.kind == EventKind::kCleared;
+            const char* rfc_type =
+                is_stored ? "stored" : (is_cleared ? "cleared" : "removed");
+            const char* legacy_type =
+                is_stored ? "BlockStored"
+                          : (is_cleared ? "AllBlocksCleared" : "BlockRemoved");
+            // Every enqueue path normalizes an empty tenant to "default" before
+            // building the PendingEvent, so no re-check is needed here.
+            const std::string& tenant_id = item.pending.tenant_id;
 
-        packer.pack("group_id");
-        PackOptionalString(packer, item.pending.group_id);
+            const size_t map_size = ComputeEventMapSize(
+                is_stored, is_cleared, config_.emit_legacy_compat_fields,
+                config_.emit_object_key);
 
-        if (config_.emit_object_key) {
-            packer.pack("object_key");
-            packer.pack(item.pending.object_key);
-        }
-
-        packer.pack("seq_hashes");
-        packer.pack_array(0);
-
-        if (config_.emit_legacy_compat_fields) {
-            packer.pack("block_hashes");
-            packer.pack_array(0);
-        }
-
-        if (is_stored) {
-            packer.pack("base_block_idx");
-            packer.pack_nil();
-            packer.pack("parent_hash");
-            packer.pack_nil();
-            packer.pack("token_ids");
-            packer.pack_nil();
+            packer.pack_map(map_size);
+            packer.pack("event_id");
+            packer.pack(item.event_id);
+            packer.pack("timestamp");
+            packer.pack(timestamp_ms);
+            packer.pack("event_type");
+            packer.pack(rfc_type);
             if (config_.emit_legacy_compat_fields) {
-                packer.pack("parent_block_hash");
+                packer.pack("type");
+                packer.pack(legacy_type);
+            }
+            packer.pack("model_name");
+            PackOptionalString(packer, config_.model_name);
+            packer.pack("block_size");
+            if (config_.block_size == 0) {
+                packer.pack_nil();
+            } else {
+                packer.pack(config_.block_size);
+            }
+            packer.pack("additional_salt");
+            PackOptionalString(packer, config_.additional_salt);
+            packer.pack("lora_name");
+            PackOptionalString(packer, config_.lora_name);
+            packer.pack("tenant_id");
+            packer.pack(tenant_id);
+            packer.pack("backend_id");
+            packer.pack(config_.backend_id);
+            packer.pack("medium");
+            PackOptionalString(packer, item.pending.medium);
+            packer.pack("dp_rank");
+            packer.pack(config_.dp_rank);
+
+            if (is_cleared) {
+                continue;
+            }
+
+            packer.pack("group_id");
+            PackOptionalString(packer, item.pending.group_id);
+
+            if (config_.emit_object_key) {
+                packer.pack("object_key");
+                packer.pack(item.pending.object_key);
+            }
+
+            packer.pack("seq_hashes");
+            packer.pack_array(0);
+
+            if (config_.emit_legacy_compat_fields) {
+                packer.pack("block_hashes");
+                packer.pack_array(0);
+            }
+
+            if (is_stored) {
+                packer.pack("base_block_idx");
+                packer.pack_nil();
+                packer.pack("parent_hash");
+                packer.pack_nil();
+                packer.pack("token_ids");
+                packer.pack_nil();
+                if (config_.emit_legacy_compat_fields) {
+                    packer.pack("parent_block_hash");
+                    packer.pack_nil();
+                }
+            } else {
+                packer.pack("base_block_idx");
                 packer.pack_nil();
             }
-        } else {
-            packer.pack("base_block_idx");
-            packer.pack_nil();
         }
-    }
 
-    packer.pack(config_.dp_rank);
+        packer.pack(config_.dp_rank);
+    }
 
     const uint64_t seq = next_zmq_sequence_.fetch_add(1);
     const uint64_t seq_be = htobe64(seq);
@@ -470,7 +552,11 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     zmq_msg_t topic_msg;
     zmq_msg_t seq_msg;
     zmq_msg_t payload_msg;
-    zmq_msg_init_size(&topic_msg, 0);
+    zmq_msg_init_size(&topic_msg, config_.topic.size());
+    if (!config_.topic.empty()) {
+        std::memcpy(zmq_msg_data(&topic_msg), config_.topic.data(),
+                    config_.topic.size());
+    }
     zmq_msg_init_size(&seq_msg, sizeof(seq_be));
     std::memcpy(zmq_msg_data(&seq_msg), &seq_be, sizeof(seq_be));
     zmq_msg_init_size(&payload_msg, payload_buffer.size());
@@ -490,9 +576,58 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     if (rc_topic >= 0 && rc_seq >= 0 && rc_payload >= 0) {
         published_batches_.fetch_add(1, std::memory_order_relaxed);
         published_events_.fetch_add(encoded.size(), std::memory_order_relaxed);
+        if (replay_socket_ && config_.replay_buffer_capacity > 0) {
+            while (replay_buffer_.size() >= config_.replay_buffer_capacity) {
+                replay_buffer_.pop_front();
+            }
+            replay_buffer_.emplace_back(
+                seq, std::string(payload_buffer.data(), payload_buffer.size()));
+        }
     } else {
         dropped_events_.fetch_add(encoded.size(), std::memory_order_relaxed);
     }
+}
+
+void KvEventPublisher::ServiceReplay() {
+    if (!replay_socket_) return;
+    zmq_pollitem_t item{replay_socket_, 0, ZMQ_POLLIN, 0};
+    if (zmq_poll(&item, 1, 0) <= 0) return;
+    std::vector<std::string> frames;
+    while (true) {
+        zmq_msg_t message;
+        zmq_msg_init(&message);
+        const int result = zmq_msg_recv(&message, replay_socket_, ZMQ_DONTWAIT);
+        if (result < 0) {
+            zmq_msg_close(&message);
+            return;
+        }
+        const auto* data = static_cast<const char*>(zmq_msg_data(&message));
+        frames.emplace_back(data, zmq_msg_size(&message));
+        const bool more = zmq_msg_more(&message);
+        zmq_msg_close(&message);
+        if (!more) break;
+    }
+    if (frames.size() != 3 || !frames[1].empty() || frames[2].size() != 8) {
+        return;
+    }
+    uint64_t start_be = 0;
+    std::memcpy(&start_be, frames[2].data(), sizeof(start_be));
+    const uint64_t start_seq = be64toh(start_be);
+    const auto send_reply = [&](uint64_t sequence, const std::string& payload) {
+        const uint64_t seq_be = htobe64(sequence);
+        return zmq_send(replay_socket_, frames[0].data(), frames[0].size(),
+                        ZMQ_SNDMORE | ZMQ_DONTWAIT) >= 0 &&
+               zmq_send(replay_socket_, "", 0, ZMQ_SNDMORE | ZMQ_DONTWAIT) >=
+                   0 &&
+               zmq_send(replay_socket_, &seq_be, sizeof(seq_be),
+                        ZMQ_SNDMORE | ZMQ_DONTWAIT) >= 0 &&
+               zmq_send(replay_socket_, payload.data(), payload.size(),
+                        ZMQ_DONTWAIT) >= 0;
+    };
+    for (const auto& [sequence, payload] : replay_buffer_) {
+        if (sequence >= start_seq && !send_reply(sequence, payload)) return;
+    }
+    send_reply(std::numeric_limits<uint64_t>::max(), "");
 }
 
 }  // namespace mooncake

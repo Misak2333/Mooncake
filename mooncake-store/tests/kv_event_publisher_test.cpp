@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -12,6 +14,7 @@
 #if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
 #include <msgpack.hpp>
 #include <zmq.h>
+#include "master_service_test_fixture.h"
 #endif
 
 namespace mooncake {
@@ -25,6 +28,7 @@ TEST(KvEventPublisherTest, DisabledPublisherIsNoop) {
     publisher.PublishStored("42", "cpu");
     publisher.PublishRemoved("42", "cpu");
     publisher.PublishCleared("tenant-a");
+    publisher.PublishReplicaUpdate("key", {{"memory", "node-a:1"}});
     const auto stats = publisher.GetStats();
     EXPECT_EQ(stats.published_events, 0u);
     EXPECT_EQ(stats.dropped_events, 0u);
@@ -610,6 +614,198 @@ TEST(KvEventPublisherTest, EmptyMediumProducesNoEvent) {
 
     publisher.SyncObjectState("object-a", {""}, "tenant-a", "group-a", {""});
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+}
+
+TEST(KvEventPublisherTest, RejectsInvalidUcsConfiguration) {
+    auto config = MakeEnabledConfig(MakeIpcEndpoint());
+    config.wire_format = "unknown";
+    EXPECT_THROW(
+        { KvEventPublisher publisher(config); }, std::invalid_argument);
+    config.wire_format = "ucs";
+    config.emit_object_key = false;
+    EXPECT_THROW(
+        { KvEventPublisher publisher(config); }, std::invalid_argument);
+}
+
+TEST(KvEventPublisherTest, PublishesUcsReplicaUpdatesOverZmq) {
+    const auto endpoint = MakeIpcEndpoint();
+    auto config = MakeEnabledConfig(endpoint);
+    config.wire_format = "ucs";
+    config.backend_id.clear();
+    KvEventPublisher publisher(config);
+    ASSERT_TRUE(publisher.enabled());
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+    const std::string key = "glm-5@tp0@0123456789abcdef";
+    publisher.PublishReplicaUpdate(key, {{"memory", "node-a:1234"},
+                                         {"memory", "node-b:1234"},
+                                         {"disk", "/cache/object"},
+                                         {"local_disk", "node-c:1234"}});
+    std::vector<std::string> frames;
+    ASSERT_TRUE(ReceiveZmqMultipart(subscriber.sub, frames));
+    ASSERT_EQ(frames.size(), 3u);
+    EXPECT_EQ(frames[0], "mooncake");
+    EXPECT_EQ(frames[1].size(), 8u);
+    auto payload = msgpack::unpack(frames[2].data(), frames[2].size());
+    ASSERT_EQ(payload.get().type, msgpack::type::ARRAY);
+    ASSERT_EQ(payload.get().via.array.size, 2u);
+    const double now = std::chrono::duration<double>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    EXPECT_NEAR(payload.get().via.array.ptr[0].as<double>(), now, 5.0);
+    const auto& event = FirstEvent(payload);
+    ASSERT_EQ(event.type, msgpack::type::ARRAY);
+    ASSERT_EQ(event.via.array.size, 3u);
+    EXPECT_EQ(MsgpackString(event.via.array.ptr[0]), "BlockUpdateEvent");
+    EXPECT_EQ(MsgpackString(event.via.array.ptr[1]), key);
+    const auto& replicas = event.via.array.ptr[2];
+    ASSERT_EQ(replicas.via.array.size, 4u);
+    EXPECT_EQ(MsgpackString(replicas.via.array.ptr[1].via.array.ptr[1]),
+              "node-b:1234");
+    EXPECT_EQ(MsgpackString(replicas.via.array.ptr[2].via.array.ptr[0]),
+              "disk");
+    EXPECT_EQ(MsgpackString(replicas.via.array.ptr[3].via.array.ptr[0]),
+              "local_disk");
+
+    publisher.PublishReplicaUpdate(key, {});
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    EXPECT_EQ(FirstEvent(payload).via.array.ptr[2].via.array.size, 0u);
+    publisher.PublishCleared();
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(FirstEvent(payload).via.array.size, 1u);
+    EXPECT_EQ(MsgpackString(FirstEvent(payload).via.array.ptr[0]),
+              "RemoveAllEvent");
+}
+
+TEST(KvEventPublisherTest, ReplaysBoundedUcsHistoryWhileIdle) {
+    auto config = MakeEnabledConfig(MakeIpcEndpoint());
+    config.wire_format = "ucs";
+    config.replay_endpoint = MakeIpcEndpoint();
+    config.replay_buffer_capacity = 2;
+    KvEventPublisher publisher(config);
+    ASSERT_TRUE(publisher.enabled());
+    for (uint64_t index = 1; index <= 3; ++index) {
+        publisher.PublishReplicaUpdate("key-" + std::to_string(index),
+                                       {{"memory", "node-a:1"}});
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (publisher.GetStats().published_batches < index &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ASSERT_EQ(publisher.GetStats().published_batches, index);
+    }
+    ScopedSubscriber replay;
+    replay.ctx = zmq_ctx_new();
+    ASSERT_NE(replay.ctx, nullptr);
+    replay.sub = zmq_socket(replay.ctx, ZMQ_DEALER);
+    ASSERT_NE(replay.sub, nullptr);
+    int timeout = 2000;
+    zmq_setsockopt(replay.sub, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
+    ASSERT_EQ(zmq_connect(replay.sub, config.replay_endpoint.c_str()), 0);
+    const unsigned char start[8]{0, 0, 0, 0, 0, 0, 0, 1};
+    ASSERT_EQ(zmq_send(replay.sub, "", 0, ZMQ_SNDMORE), 0);
+    ASSERT_EQ(zmq_send(replay.sub, start, sizeof(start), 0), 8);
+    for (uint64_t expected = 2; expected <= 3; ++expected) {
+        std::vector<std::string> frames;
+        ASSERT_TRUE(ReceiveZmqMultipart(replay.sub, frames));
+        ASSERT_EQ(frames.size(), 3u);
+        ASSERT_EQ(frames[1].size(), 8u);
+        uint64_t sequence = 0;
+        for (unsigned char byte : frames[1]) sequence = (sequence << 8) | byte;
+        EXPECT_EQ(sequence, expected);
+        auto payload = msgpack::unpack(frames[2].data(), frames[2].size());
+        EXPECT_EQ(MsgpackString(FirstEvent(payload).via.array.ptr[1]),
+                  "key-" + std::to_string(expected));
+    }
+    std::vector<std::string> end;
+    ASSERT_TRUE(ReceiveZmqMultipart(replay.sub, end));
+    ASSERT_EQ(end.size(), 3u);
+    EXPECT_EQ(end[1], std::string(8, static_cast<char>(0xff)));
+    EXPECT_TRUE(end[2].empty());
+}
+
+class UcsStoreEventTest : public test::MasterServiceTest {};
+
+TEST_F(UcsStoreEventTest, RejectsMultiTenantLegacyProtocol) {
+    auto config = MasterServiceConfig::builder().build();
+    config.enable_kv_events = true;
+    config.kv_events_wire_format = "ucs";
+    config.enable_multi_tenants = true;
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+}
+
+TEST_F(UcsStoreEventTest, PublishesPositionChangesWithinOneTier) {
+    const auto endpoint = MakeIpcEndpoint();
+    auto config = MasterServiceConfig::builder().build();
+    config.enable_kv_events = true;
+    config.kv_events_wire_format = "ucs";
+    config.kv_events_bind_endpoint = endpoint;
+    MasterService service(config);
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint, 5000));
+    const auto first = PrepareSimpleSegment(service, "node-a:1");
+    const auto second = PrepareSimpleSegment(
+        service, "node-b:1", kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig placement;
+    placement.replica_num = 2;
+    placement.preferred_segments = {"node-a:1", "node-b:1"};
+    const std::string key = "glm-5@tp0@0123456789abcdef";
+    ASSERT_TRUE(service
+                    .PutStart(first.client_id, key, TenantId::Default(), 1024,
+                              placement)
+                    .has_value());
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    ASSERT_TRUE(service
+                    .PutEnd(first.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    msgpack::object_handle payload;
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(FirstEvent(payload).via.array.ptr[2].via.array.size, 2u);
+    ASSERT_TRUE(
+        service.UnmountSegment(first.segment_id, first.client_id).has_value());
+    ClearInvalidHandlesForTest(service);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    const auto& remaining = FirstEvent(payload).via.array.ptr[2];
+    ASSERT_EQ(remaining.via.array.size, 1u);
+    EXPECT_EQ(MsgpackString(remaining.via.array.ptr[0].via.array.ptr[1]),
+              "node-b:1");
+    ASSERT_TRUE(service.UnmountSegment(second.segment_id, second.client_id)
+                    .has_value());
+    ClearInvalidHandlesForTest(service);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    EXPECT_EQ(FirstEvent(payload).via.array.ptr[2].via.array.size, 0u);
+}
+
+TEST_F(UcsStoreEventTest, RemoveAllRetractsEachDeletedObject) {
+    const auto endpoint = MakeIpcEndpoint();
+    auto config = MasterServiceConfig::builder().build();
+    config.enable_kv_events = true;
+    config.kv_events_wire_format = "ucs";
+    config.kv_events_bind_endpoint = endpoint;
+    MasterService service(config);
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+    const auto segment = PrepareSimpleSegment(service, "node-a:1");
+    const std::string key = "glm-5@tp0@0123456789abcdef";
+    ReplicateConfig placement;
+    ASSERT_TRUE(service
+                    .PutStart(segment.client_id, key, TenantId::Default(), 1024,
+                              placement)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(segment.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    msgpack::object_handle payload;
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(service.RemoveAll(TenantId::Default(), true), 1);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    const auto& removed = FirstEvent(payload);
+    ASSERT_EQ(removed.via.array.size, 3u);
+    EXPECT_EQ(MsgpackString(removed.via.array.ptr[1]), key);
+    EXPECT_EQ(removed.via.array.ptr[2].via.array.size, 0u);
 }
 
 #endif  // MOONCAKE_ENABLE_KV_EVENTS

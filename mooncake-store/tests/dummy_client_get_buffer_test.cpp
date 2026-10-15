@@ -52,6 +52,9 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::get_into_ranges_staged_shm_helper>(
         &rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_get_into_multi_buffers_from_segments_dummy_helper>(
+        &rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
@@ -218,6 +221,32 @@ class DummyClientGetBufferTest : public ::testing::Test {
     std::optional<std::string> saved_hot_shm_env_;
 };
 // ---- Regression: a stable hot-cache entry must be invalidated by remove ----
+TEST_F(DummyClientGetBufferTest, ReadsFromSelectedSegmentIntoUserBuffers) {
+    ASSERT_TRUE(SetupStack());
+    const std::string key = "ucs-dummy-source";
+    const std::string data(4096, 'x');
+    PutData(key, data);
+    const auto replicas = real_client_->get_replica_desc(key);
+    ASSERT_FALSE(replicas.empty());
+    const auto source = replicas[0]
+                            .get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_;
+    std::string destination(data.size(), '0');
+    ASSERT_EQ(
+        dummy_client_->register_buffer(destination.data(), destination.size()),
+        0);
+    auto result = dummy_client_->batch_get_into_multi_buffers_from_segments(
+        {key}, {{destination.data()}}, {{destination.size()}}, {source});
+    EXPECT_EQ(result, std::vector<int>({4096}));
+    EXPECT_EQ(destination, data);
+    std::fill(destination.begin(), destination.end(), '0');
+    result = dummy_client_->batch_get_into_multi_buffers_from_segments(
+        {key}, {{destination.data()}}, {{destination.size()}}, {"absent:1234"});
+    EXPECT_EQ(result, std::vector<int>({toInt(ErrorCode::REPLICA_NOT_FOUND)}));
+    EXPECT_EQ(destination, std::string(data.size(), '0'));
+    EXPECT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+}
+
 TEST_F(DummyClientGetBufferTest,
        StableHotCacheEntryShouldBeInvalidatedByRemove) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";

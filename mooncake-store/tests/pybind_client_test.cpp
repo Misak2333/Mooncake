@@ -1418,6 +1418,80 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
+TEST_F(RealClientTest, BatchGetFromSegmentsHonorsSourcesAndPartialFailures) {
+    StartMasterAndSetupClient();
+    auto peer = RealClient::create();
+    ASSERT_EQ(
+        peer->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                         16 * 1024 * 1024, FLAGS_protocol, FLAGS_device_name,
+                         master_address_),
+        0);
+    const std::string first_key = "ucs-source-a";
+    const std::string second_key = "ucs-source-b";
+    const std::string first_value(128, 'a');
+    const std::string second_value(128, 'b');
+    ReplicateConfig placement;
+    placement.preferred_segments = {py_client_->get_hostname()};
+    ASSERT_EQ(py_client_->put(first_key,
+                              std::span(first_value.data(), first_value.size()),
+                              placement),
+              0);
+    placement.preferred_segments = {peer->get_hostname()};
+    ASSERT_EQ(peer->put(second_key,
+                        std::span(second_value.data(), second_value.size()),
+                        placement),
+              0);
+    const auto first_replicas = py_client_->get_replica_desc(first_key);
+    const auto second_replicas = peer->get_replica_desc(second_key);
+    ASSERT_FALSE(first_replicas.empty());
+    ASSERT_FALSE(second_replicas.empty());
+    const auto first_source = first_replicas[0]
+                                  .get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_;
+    const auto second_source = second_replicas[0]
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+    ASSERT_NE(first_source, second_source);
+    std::vector<std::string> destinations(3, std::string(128, '0'));
+    std::vector<std::vector<void*>> buffers;
+    for (auto& destination : destinations) {
+        ASSERT_EQ(
+            py_client_->register_buffer(destination.data(), destination.size()),
+            0);
+        buffers.push_back({destination.data()});
+    }
+    const std::vector<std::vector<size_t>> sizes(3, {128});
+    auto result = py_client_->batch_get_into_multi_buffers_from_segments(
+        {first_key, second_key, first_key}, buffers, sizes,
+        {"tcp://" + first_source, second_source, first_source});
+    EXPECT_EQ(result, std::vector<int>({128, 128, 128}));
+    EXPECT_EQ(destinations[0], first_value);
+    EXPECT_EQ(destinations[1], second_value);
+    EXPECT_EQ(destinations[2], first_value);
+
+    std::fill(destinations[0].begin(), destinations[0].end(), '0');
+    result = py_client_->batch_get_into_multi_buffers_from_segments(
+        {first_key, second_key, "missing-key"}, buffers, sizes,
+        {second_source, second_source, first_source});
+    ASSERT_EQ(result.size(), 3u);
+    EXPECT_EQ(result[0], toInt(ErrorCode::REPLICA_NOT_FOUND));
+    EXPECT_EQ(result[1], 128);
+    EXPECT_EQ(result[2], toInt(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(destinations[0], std::string(128, '0'));
+
+    result = py_client_->batch_get_into_multi_buffers_from_segments(
+        {first_key, first_key, first_key}, buffers, sizes,
+        {first_source, second_source, first_source});
+    EXPECT_EQ(result, std::vector<int>(3, toInt(ErrorCode::INVALID_PARAMS)));
+    result = py_client_->batch_get_into_multi_buffers_from_segments(
+        {first_key, second_key, first_key}, buffers, sizes, {});
+    EXPECT_EQ(result, std::vector<int>({128, 128, 128}));
+    for (auto& destination : destinations) {
+        EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    }
+    peer->tearDownAll();
+}
+
 TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))

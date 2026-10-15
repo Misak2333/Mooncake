@@ -26,6 +26,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -33,6 +35,41 @@
 #include "replica.h"
 
 namespace mooncake {
+
+inline std::string_view NormalizeSourceSegment(std::string_view segment) {
+    if (segment.starts_with("tcp://")) segment.remove_prefix(6);
+    return segment;
+}
+
+inline bool ValidateSourceSegments(
+    const std::vector<std::string> &keys,
+    const std::vector<std::string> &source_segments) {
+    if (source_segments.empty()) return true;
+    if (source_segments.size() != keys.size()) return false;
+    std::unordered_map<std::string, std::string_view> source_by_key;
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const auto source = NormalizeSourceSegment(source_segments[index]);
+        auto [entry, inserted] = source_by_key.emplace(keys[index], source);
+        if (!inserted && entry->second != source) return false;
+    }
+    return true;
+}
+
+inline const Replica::Descriptor *SelectMemoryReplicaFromSegment(
+    const std::vector<Replica::Descriptor> &replicas,
+    std::string_view source_segment) {
+    const auto normalized = NormalizeSourceSegment(source_segment);
+    for (const auto &replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE ||
+            !replica.is_memory_replica())
+            continue;
+        if (NormalizeSourceSegment(
+                replica.get_memory_descriptor()
+                    .buffer_descriptor.transport_endpoint_) == normalized)
+            return &replica;
+    }
+    return nullptr;
+}
 
 // Scores a remote replica candidate; lower score == more preferred.
 using ReplicaScorer = std::function<double(const Replica::Descriptor &)>;

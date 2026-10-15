@@ -190,6 +190,12 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    std::vector<int> batch_get_into_multi_buffers_from_segments(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::string> &source_segments) override;
+
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
@@ -554,6 +560,14 @@ class RealClient : public PyClient {
         bool prefer_alloc_in_same_node, int32_t device_id,
         const UUID &client_id);
 
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_from_segments_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::string> &source_segments, int32_t device_id,
+        const UUID &client_id);
+
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity,
@@ -710,7 +724,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_same_node,
+        const std::vector<std::string> &source_segments =
+            std::vector<std::string>{});
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,

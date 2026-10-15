@@ -1438,11 +1438,11 @@ class MasterService {
         TenantState& tenant_state, ObjectMap::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard,
-        const std::vector<std::string>& previous_media_hint = {});
+        const KvObjectState& previous_media_hint = {});
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
-        const std::vector<std::string>& previous_media_hint = {});
+        const KvObjectState& previous_media_hint = {});
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1819,7 +1819,7 @@ class MasterService {
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
-        void Erase(const std::vector<std::string>& previous_media_hint = {})
+        void Erase(const KvObjectState& previous_media_hint = {})
             NO_THREAD_SAFETY_ANALYSIS {
             service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
                                     QuotaEraseMode::kFull, &shard_guard_,
@@ -2310,14 +2310,23 @@ class MasterService {
     // Gated snapshots for the call sites that capture a pre-mutation medium
     // set. They run on hot metadata paths, so skip the VisitReplicas walk
     // entirely when no publisher is listening.
-    std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForMetadata(metadata)
-                                 : std::vector<std::string>{};
+    KvObjectState KvMediaSnapshot(const ObjectMetadata& metadata) {
+        if (!KvEventsEnabled()) return {};
+        return {KvMediaForMetadata(metadata),
+                kv_event_publisher_->ucs_format()
+                    ? KvReplicaLocations(metadata, false, true)
+                    : std::vector<KvReplicaLocation>{}};
     }
-    std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForRemoval(metadata)
-                                 : std::vector<std::string>{};
+    KvObjectState KvRemovalSnapshot(const ObjectMetadata& metadata) {
+        if (!KvEventsEnabled()) return {};
+        return {KvMediaForRemoval(metadata),
+                kv_event_publisher_->ucs_format()
+                    ? KvReplicaLocations(metadata, true, true)
+                    : std::vector<KvReplicaLocation>{}};
     }
+    static std::vector<KvReplicaLocation> KvReplicaLocations(
+        const ObjectMetadata& metadata, bool include_removed = false,
+        bool include_invalid = false);
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::vector<std::string> KvMediaForMetadata(
@@ -2331,14 +2340,14 @@ class MasterService {
     // replica type that triggered the commit, so no replica type is taken.
     void PublishKvStored(const std::string& key, const ObjectMetadata& metadata,
                          const TenantId& tenant_id);
-    void SyncKvObjectState(
-        const std::string& key, const ObjectMetadata& metadata,
-        const TenantId& tenant_id,
-        const std::vector<std::string>& previous_media_hint = {});
-    void PublishKvRemoved(
-        const std::string& key, const ObjectMetadata& metadata,
-        const TenantId& tenant_id,
-        const std::vector<std::string>& previous_media_hint = {});
+    void SyncKvObjectState(const std::string& key,
+                           const ObjectMetadata& metadata,
+                           const TenantId& tenant_id,
+                           const KvObjectState& previous_media_hint = {});
+    void PublishKvRemoved(const std::string& key,
+                          const ObjectMetadata& metadata,
+                          const TenantId& tenant_id,
+                          const KvObjectState& previous_media_hint = {});
     // evicted_replica_count is the number of replicas the caller actually
     // dropped. It is deliberately not a byte count: a zero-length object still
     // needs its removal announced.

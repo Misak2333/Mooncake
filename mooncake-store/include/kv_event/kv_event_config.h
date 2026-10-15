@@ -2,8 +2,23 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mooncake {
+
+using KvReplicaLocation = std::pair<std::string, std::string>;
+
+struct KvObjectState {
+    std::vector<std::string> media;
+    std::vector<KvReplicaLocation> replicas;
+
+    void Merge(const KvObjectState& other) {
+        media.insert(media.end(), other.media.begin(), other.media.end());
+        replicas.insert(replicas.end(), other.replicas.begin(),
+                        other.replicas.end());
+    }
+};
 
 // Publisher transport, identity, and fixed model context for the optional KV
 // Events ZMQ socket (RFC #1527). One publisher serves one model/block-size/
@@ -22,6 +37,10 @@ struct KvEventConfig {
     // Max pending events in the async publisher queue; oldest dropped when
     // full.
     uint32_t queue_capacity{65536};
+    std::string wire_format{"native"};
+    std::string topic;
+    std::string replay_endpoint;
+    uint32_t replay_buffer_capacity{10000};
 
     // Fixed publisher context supplied by the Master configuration.
     std::string model_name;
