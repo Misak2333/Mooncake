@@ -13,6 +13,7 @@
 #include "conductor/prefixindex/cache_layout.h"
 #include "conductor/prefixindex/hash_strategy.h"
 #include "conductor/prefixindex/hybrid_index.h"
+#include "conductor/prefixindex/layout_parser.h"
 #include "conductor/zmq/msg_decoder.h"
 #include "event_manager_test_peer.h"
 #include "prefix_indexer_test_peer.h"
@@ -728,10 +729,8 @@ TEST(SpecialKVEvents, NativeSglangPagesCannotManufactureIndependentComponents) {
               0u);
 }
 
-TEST(SpecialKVEvents,
-     OffloadCheckpointIsAcceptedButUnknownChunkUnitIsRejected) {
-    auto binding = Binding();
-    binding.source = LayoutSource::kVllmOffload;
+TEST(SpecialKVEvents, ConnectorCpuAnnouncementsDoNotChangeGroupedResidency) {
+    const auto binding = Binding();
     const auto service = Service();
     EventManager manager({}, 0);
     ASSERT_TRUE(manager.GetIndexer()
@@ -742,19 +741,20 @@ TEST(SpecialKVEvents,
     zmq::VllmStoredEvent event;
     event.block_size = 16;
     event.medium = "cpu";
-    event.group_idx = 0;
     event.block_hashes = {Hashes().back().projected.value};
-    EXPECT_FALSE(kvevent::KVEventHandlerTestPeer::HandleVllmStored(
-                     handler, event, Metadata(service))
-                     .empty());
-    event.group_idx = 1;
-    event.kv_cache_spec_kind = "mamba";
-    event.token_ids = std::vector<int32_t>{};
-    ASSERT_EQ(kvevent::KVEventHandlerTestPeer::HandleVllmStored(
-                  handler, event, Metadata(service)),
-              "");
+    for (int64_t group : {0, 1}) {
+        event.group_idx = group;
+        ASSERT_EQ(handler.HandleBatch(Batch(event), Metadata(service)), "");
+    }
     EXPECT_EQ(Query(*manager.GetIndexer()).device, 0);
-    EXPECT_EQ(Query(*manager.GetIndexer()).cpu_local, 160);
+    EXPECT_EQ(Query(*manager.GetIndexer()).disk, 0);
+    ASSERT_EQ(manager.GetIndexer()->StoreGrouped(Engine(1, {160})), "");
+    zmq::VllmRemovedEvent removed;
+    removed.medium = "cpu";
+    removed.group_idx = 1;
+    removed.block_hashes = event.block_hashes;
+    ASSERT_EQ(handler.HandleBatch(Batch(removed), Metadata(service)), "");
+    EXPECT_EQ(Query(*manager.GetIndexer()).device, 160);
 }
 
 TEST(SpecialKVEvents, MooncakeMinimalRemoveRetractsOneRequiredObject) {
@@ -830,8 +830,8 @@ TEST(SpecialKVDeployment, CompleteDeclarationIsValidatedBeforeActivation) {
     service.model_name = "GLM-5.3-Flash";
     SourceLayout binding;
     const auto valid = AscendDeployment();
-    ASSERT_EQ(
-        ResolveAscendDeployment(service, valid.toStyledString(), &binding), "");
+    ASSERT_EQ(ResolveVllmDeployment(service, valid.toStyledString(), &binding),
+              "");
     EXPECT_EQ(binding.layout->groups.size(), 2u);
     EXPECT_EQ(binding.layout->groups[1].match, MatchPolicy::kCheckpoint);
     EXPECT_EQ(binding.layout->groups[1].parts.size(), 2u);
@@ -840,25 +840,25 @@ TEST(SpecialKVDeployment, CompleteDeclarationIsValidatedBeforeActivation) {
         auto invalid = valid;
         invalid[field] = Json::arrayValue;
         EXPECT_FALSE(
-            ResolveAscendDeployment(service, invalid.toStyledString(), &binding)
+            ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
                 .empty())
             << field;
     }
     auto invalid = valid;
     invalid["groups"][1]["mamba_cache_mode"] = "none";
     EXPECT_FALSE(
-        ResolveAscendDeployment(service, invalid.toStyledString(), &binding)
+        ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
             .empty());
     invalid = valid;
     invalid["groups"][1]["key_prefixes"][1] =
         invalid["groups"][1]["key_prefixes"][0];
     EXPECT_FALSE(
-        ResolveAscendDeployment(service, invalid.toStyledString(), &binding)
+        ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
             .empty());
     invalid = valid;
     invalid["groups"].resize(1);
     EXPECT_FALSE(
-        ResolveAscendDeployment(service, invalid.toStyledString(), &binding)
+        ResolveVllmDeployment(service, invalid.toStyledString(), &binding)
             .empty());
 }
 

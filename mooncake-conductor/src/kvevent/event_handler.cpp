@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "ascii_string.h"
 #include "conductor/kvevent/object_key_parser.h"
+#include "conductor/prefixindex/layout_parser.h"
 #include "integer_parser.h"
 
 namespace mooncake::conductor::kvevent {
@@ -83,13 +85,6 @@ std::optional<prefixindex::StorageTier> SglangLocalTier(
 
 std::string OriginalMedium(const std::optional<std::string>& medium) {
     return medium.value_or("");
-}
-
-std::string ValidateVllmGroup(std::optional<int64_t> group) {
-    if (group.has_value() && *group != 0) {
-        return "only cache group zero is supported";
-    }
-    return "";
 }
 
 std::string ValidateMooncakeGroup(
@@ -208,46 +203,6 @@ std::string ValidateSeqHashes(const std::vector<uint64_t>& seq_hashes,
     return "";
 }
 
-std::string ValidateVllmStoredAssertions(const zmq::VllmStoredEvent& event,
-                                         const common::ServiceConfig& service) {
-    if (event.block_size != service.block_size) {
-        return "block_size mismatch: expected " +
-               std::to_string(service.block_size) + ", got " +
-               std::to_string(event.block_size);
-    }
-    if (event.lora_id.has_value()) {
-        // Modern vLLM hashes the adapter name, but still publishes the legacy
-        // numeric ID. It need not match an ID on another engine. ID-only
-        // events cannot establish the name used by our query hash strategy.
-        if (*event.lora_id <= 0) {
-            return "lora_id must be positive when provided";
-        }
-        if (event.lora_name.value_or("").empty()) {
-            return "lora_name is required when lora_id is provided";
-        }
-    }
-    if (event.lora_name.value_or("") != service.lora_name) {
-        return "lora_name conflicts with trusted registration";
-    }
-    if (std::string error = ValidateVllmGroup(event.group_idx);
-        !error.empty()) {
-        return error;
-    }
-    // MLA shares the full-attention prefix lifecycle. Static sink blocks are
-    // separate from request blocks and do not participate in their events.
-    if (event.kv_cache_spec_kind.has_value() &&
-        *event.kv_cache_spec_kind != "full_attention" &&
-        *event.kv_cache_spec_kind != "mla_attention" &&
-        *event.kv_cache_spec_kind != "sink_full_attention") {
-        return "unsupported kv_cache_spec_kind assertion: " +
-               *event.kv_cache_spec_kind;
-    }
-    if (event.kv_cache_spec_sliding_window.has_value()) {
-        return "sliding-window cache specs are not supported";
-    }
-    return "";
-}
-
 prefixindex::ContextKey MooncakeContext(
     const zmq::MooncakeEventFields& fields) {
     return {.tenant_id = fields.tenant_id,
@@ -276,6 +231,83 @@ size_t HashCount(const Event& event) {
     return event.block_hashes.size();
 }
 
+constexpr size_t kMaxPendingBatches = 256;
+constexpr size_t kMaxPendingEvents = 4096;
+constexpr size_t kMaxPendingBytes = 64 * 1024 * 1024;
+
+struct PendingBatchUsage {
+    size_t event_count;
+    size_t bytes;
+};
+
+size_t HashPayloadBytes(const std::vector<uint64_t>& hashes) {
+    return hashes.size() * sizeof(uint64_t);
+}
+
+size_t HashPayloadBytes(const std::vector<zmq::ExternalHash>& hashes) {
+    size_t bytes = hashes.size() * sizeof(zmq::ExternalHash);
+    for (const auto& hash : hashes) {
+        if (const auto* binary = std::get_if<std::vector<uint8_t>>(&hash))
+            bytes += binary->size();
+    }
+    return bytes;
+}
+
+// Approximate retained payload size for the startup queue's memory budget.
+template <typename Event>
+size_t EstimatePendingEventBytes(const Event& event) {
+    size_t bytes = sizeof(event);
+    if constexpr (requires { event.block_hashes; })
+        bytes += HashPayloadBytes(event.block_hashes);
+    if constexpr (requires { event.token_ids; })
+        if (event.token_ids) bytes += event.token_ids->size() * sizeof(int32_t);
+    if constexpr (requires { event.kv_cache_layout; })
+        if (event.kv_cache_layout) bytes += event.kv_cache_layout->size();
+    if constexpr (requires { event.fields; }) {
+        bytes += event.fields.backend_id.size() + event.fields.tenant_id.size();
+        for (const auto* text :
+             {&event.fields.model_name, &event.fields.lora_name,
+              &event.fields.additional_salt, &event.fields.medium})
+            if (*text) bytes += text->value().size();
+    }
+    if constexpr (requires { event.object; }) {
+        for (const auto* text :
+             {&event.object.object_key, &event.object.group_id,
+              &event.object.connector_block_hash, &event.object.cache_prefix})
+            if (*text) bytes += text->value().size();
+        bytes += event.object.seq_hashes.size() * sizeof(uint64_t);
+        if (event.object.legacy_block_hashes)
+            bytes +=
+                event.object.legacy_block_hashes->size() * sizeof(uint64_t);
+    }
+    return bytes;
+}
+
+template <typename Batch>
+PendingBatchUsage EstimatePendingBatchUsage(const Batch& batch) {
+    PendingBatchUsage usage{batch.events.size(), sizeof(batch)};
+    for (const auto& decoded : batch.events) {
+        usage.bytes += sizeof(decoded) + decoded.error.size();
+        if (decoded.ok()) {
+            usage.bytes += std::visit(
+                [](const auto& event) {
+                    return EstimatePendingEventBytes(event);
+                },
+                *decoded.event);
+        }
+    }
+    return usage;
+}
+
+PendingBatchUsage EstimatePendingUsage(const zmq::DecodedBatch& batch,
+                                       const zmq::MessageMetadata& metadata) {
+    auto usage = std::visit(
+        [](const auto& item) { return EstimatePendingBatchUsage(item); },
+        batch);
+    usage.bytes += metadata.endpoint.size() + metadata.topic.size();
+    return usage;
+}
+
 }  // namespace
 
 KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
@@ -287,76 +319,12 @@ KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
 
 std::string KVEventHandler::QueuePending(const zmq::DecodedBatch& batch,
                                          const zmq::MessageMetadata& metadata) {
-    const size_t count =
-        std::visit([](const auto& item) { return item.events.size(); }, batch);
-    const size_t bytes =
-        std::visit(
-            [](const auto& item) {
-                size_t total = sizeof(item);
-                for (const auto& decoded : item.events) {
-                    total += sizeof(decoded) + decoded.error.size();
-                    if (!decoded.ok()) continue;
-                    total += std::visit(
-                        [](const auto& event) {
-                            size_t size = sizeof(event);
-                            if constexpr (requires { event.block_hashes; }) {
-                                size += event.block_hashes.size() *
-                                        sizeof(event.block_hashes[0]);
-                                if constexpr (std::is_same_v<
-                                                  std::decay_t<decltype(event)>,
-                                                  zmq::VllmStoredEvent> ||
-                                              std::is_same_v<
-                                                  std::decay_t<decltype(event)>,
-                                                  zmq::VllmRemovedEvent>) {
-                                    for (const auto& hash : event.block_hashes)
-                                        if (const auto* binary = std::get_if<
-                                                std::vector<uint8_t>>(&hash))
-                                            size += binary->size();
-                                }
-                            }
-                            if constexpr (requires { event.token_ids; })
-                                if (event.token_ids)
-                                    size += event.token_ids->size() *
-                                            sizeof(int32_t);
-                            if constexpr (requires { event.kv_cache_layout; })
-                                if (event.kv_cache_layout)
-                                    size += event.kv_cache_layout->size();
-                            if constexpr (requires { event.fields; }) {
-                                size += event.fields.backend_id.size() +
-                                        event.fields.tenant_id.size();
-                                for (const auto* text :
-                                     {&event.fields.model_name,
-                                      &event.fields.lora_name,
-                                      &event.fields.additional_salt,
-                                      &event.fields.medium})
-                                    if (*text) size += text->value().size();
-                            }
-                            if constexpr (requires { event.object; }) {
-                                for (const auto* text :
-                                     {&event.object.object_key,
-                                      &event.object.group_id,
-                                      &event.object.connector_block_hash,
-                                      &event.object.cache_prefix})
-                                    if (*text) size += text->value().size();
-                                size += event.object.seq_hashes.size() *
-                                        sizeof(uint64_t);
-                                if (event.object.legacy_block_hashes)
-                                    size += event.object.legacy_block_hashes
-                                                ->size() *
-                                            sizeof(uint64_t);
-                            }
-                            return size;
-                        },
-                        *decoded.event);
-                }
-                return total;
-            },
-            batch) +
-        metadata.endpoint.size() + metadata.topic.size();
+    const auto usage = EstimatePendingUsage(batch, metadata);
     // Bounded startup buffering, never silent loss: overflow quarantines the
     // source until it is explicitly resynchronized/re-registered.
-    if (count > 4096 - pending_event_count_ || pending_.size() >= 256 ||
-        bytes > 64 * 1024 * 1024 - pending_bytes_) {
+    if (usage.event_count > kMaxPendingEvents - pending_event_count_ ||
+        pending_.size() >= kMaxPendingBatches ||
+        usage.bytes > kMaxPendingBytes - pending_bytes_) {
         pending_.clear();
         pending_event_count_ = 0;
         pending_bytes_ = 0;
@@ -364,8 +332,8 @@ std::string KVEventHandler::QueuePending(const zmq::DecodedBatch& batch,
         return "deployment startup buffer exceeded; source must resynchronize";
     }
     pending_.emplace_back(batch, metadata);
-    pending_event_count_ += count;
-    pending_bytes_ += bytes;
+    pending_event_count_ += usage.event_count;
+    pending_bytes_ += usage.bytes;
     return "";
 }
 
@@ -503,7 +471,7 @@ std::string KVEventHandler::HandleVllmBatch(
                 *stored->kv_cache_layout == deployment_declaration_)
                 continue;
             prefixindex::SourceLayout binding;
-            if (auto error = prefixindex::ResolveAscendDeployment(
+            if (auto error = prefixindex::ResolveVllmDeployment(
                     service_, *stored->kv_cache_layout, &binding);
                 !error.empty())
                 return error;
@@ -933,7 +901,8 @@ std::string KVEventHandler::HandleMooncakeBatch(
 std::string KVEventHandler::HandleVllmStored(
     const zmq::VllmStoredEvent& event, const zmq::MessageMetadata& metadata) {
     if (layout_.layout) return HandleGroupedVllmStored(event);
-    if (std::string error = ValidateVllmStoredAssertions(event, service_);
+    if (std::string error =
+            prefixindex::ValidateVllmStoredAssertions(event, service_);
         !error.empty()) {
         return error;
     }
@@ -969,7 +938,7 @@ std::string KVEventHandler::HandleVllmStored(
 std::string KVEventHandler::HandleVllmRemoved(
     const zmq::VllmRemovedEvent& event, const zmq::MessageMetadata& metadata) {
     if (layout_.layout) return HandleGroupedVllmRemoved(event);
-    if (std::string error = ValidateVllmGroup(event.group_idx);
+    if (std::string error = prefixindex::ValidateVllmGroup(event.group_idx);
         !error.empty()) {
         return error;
     }

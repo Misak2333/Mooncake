@@ -1,11 +1,11 @@
 #include "conductor/kvevent/event_manager.h"
 
-#include <algorithm>
 #include <string_view>
 
 #include "ascii_string.h"
 #include "conductor/kvevent/object_key_parser.h"
 #include "conductor/prefixindex/hybrid_index.h"
+#include "conductor/prefixindex/layout_parser.h"
 
 namespace mooncake::conductor::kvevent {
 namespace {
@@ -36,8 +36,6 @@ std::optional<StorageTier> EngineTier(
             return StorageTier::kCpuLocal;
         if (name == "disk") return StorageTier::kDisk;
     }
-    if (name == "cpu" && binding.source == LayoutSource::kVllmOffload)
-        return StorageTier::kCpuLocal;
     return std::nullopt;
 }
 
@@ -53,7 +51,7 @@ std::string ResolveGroup(const prefixindex::SourceLayout& binding,
                          std::optional<int64_t> id, size_t* slot) {
     const auto group = binding.groups.find(id.value_or(0));
     if (group == binding.groups.end())
-        return "event group is not present in the static source mapping";
+        return "event group is not present in the deployment mapping";
     *slot = group->second;
     return "";
 }
@@ -80,7 +78,7 @@ std::string ObjectMutation(const common::ServiceConfig& service,
         if (selected) return "object key matches multiple layout rules";
         selected = &rule;
     }
-    if (!selected) return "object key does not match the static layout";
+    if (!selected) return "object key does not match the deployment layout";
     const auto hash = key.substr(
         selected->key_prefix.size(),
         key.size() - selected->key_prefix.size() - selected->key_suffix.size());
@@ -129,49 +127,10 @@ std::string KVEventHandler::HandleGroupedVllmStored(
         !error.empty())
         return error;
     const auto& group = layout_.layout->groups[slot];
-    if (*tier == StorageTier::kCpuLocal &&
-        group.match != MatchPolicy::kCheckpoint)
-        return "CPU offload chunks require a verified retrieval-unit policy";
-    if (group.trailing_blocks > 0) {
-        const int64_t expected =
-            group.window_tokens > 0
-                ? (group.window_tokens - 1) / group.block_tokens +
-                      ((group.window_tokens - 1) % group.block_tokens != 0)
-                : -1;
-        if (expected < 0 ||
-            group.trailing_blocks != std::max<int64_t>(1, expected))
-            return "retained-page policy is not a native vLLM sliding window";
-    }
-    if (event.block_size <= 0)
-        return "placeholder event cannot prove cache residency";
-    // Native vLLM also advertises fine-grained aliases for an existing dense
-    // page. Keep their endpoint hashes; Query still accepts only complete
-    // physical-group/alignment boundaries, never the partial alias itself.
-    const bool dense_alias =
-        *tier == StorageTier::kDevice && group.match == MatchPolicy::kDense &&
-        event.block_size <= group.block_tokens &&
-        event.block_size % layout_.layout->hash_unit_tokens == 0;
-    if (group.match != MatchPolicy::kCheckpoint &&
-        event.block_size != group.block_tokens && !dense_alias)
-        return "event block_size conflicts with group logical span";
-    if (event.lora_name.value_or("") != service_.lora_name ||
-        (event.lora_id && (*event.lora_id <= 0 || !event.lora_name)))
-        return "event LoRA conflicts with registration";
-    if (event.kv_cache_spec_kind) {
-        const auto& kind = *event.kv_cache_spec_kind;
-        const bool accepted =
-            !group.event_kind.empty()                 ? kind == group.event_kind
-            : group.match == MatchPolicy::kCheckpoint ? kind == "mamba"
-            : group.match == MatchPolicy::kWindow
-                ? kind == "sliding_window"
-                : (kind == "full_attention" || kind == "mla_attention" ||
-                   kind == "sink_full_attention");
-        if (!accepted) return "event kind conflicts with group match policy";
-    }
-    if (event.kv_cache_spec_sliding_window &&
-        (group.match != MatchPolicy::kWindow ||
-         *event.kv_cache_spec_sliding_window != group.window_tokens))
-        return "event window conflicts with layout";
+    if (auto error = prefixindex::ValidateVllmGroupedStoredAssertions(
+            event, service_, *layout_.layout, group, *tier);
+        !error.empty())
+        return error;
     GroupMutation mutation{.context = Context(service_),
                            .group = slot,
                            .tier = *tier,

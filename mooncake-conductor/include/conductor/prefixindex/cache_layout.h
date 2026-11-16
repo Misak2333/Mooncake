@@ -16,13 +16,7 @@
 namespace mooncake::conductor::prefixindex {
 
 enum class MatchPolicy { kDense, kCheckpoint, kWindow };
-enum class LayoutSource {
-    kVllm,
-    kVllmOffload,
-    kVllmAnnouncement,
-    kSglang,
-    kMooncake
-};
+enum class LayoutSource { kVllm, kVllmAnnouncement, kSglang, kMooncake };
 
 struct CacheGroupLayout {
     std::string id;
@@ -40,7 +34,8 @@ struct CacheGroupLayout {
     bool operator==(const CacheGroupLayout&) const = default;
 };
 
-// Immutable after registration. Token counts refer to logical KV positions.
+// Read-only geometry; deployment activation replaces the initial placeholder.
+// Token counts refer to logical KV positions.
 struct CacheLayout {
     std::string id;
     int64_t hash_unit_tokens = 0;
@@ -66,7 +61,8 @@ struct ObjectPartRule {
     bool operator==(const ObjectPartRule&) const = default;
 };
 
-// Server-owned binding; never serialized in ServiceConfig or client RPCs.
+// Internal binding derived from model rules and validated deployment metadata.
+// Never serialized in ServiceConfig or client RPCs.
 struct SourceLayout {
     std::shared_ptr<const CacheLayout> layout;
     LayoutSource source = LayoutSource::kVllm;
@@ -92,11 +88,6 @@ struct ModelCacheSpec {
 // ordinary path; model names and ContextKeys are never rewritten.
 const ModelCacheSpec* FindModelCacheSpec(std::string_view model_name);
 SourceLayout ResolveModelLayout(const common::ServiceConfig& service);
-// Deployment parameters only; supported recovery policies remain model-owned.
-std::string ResolveAscendDeployment(const common::ServiceConfig& service,
-                                    std::string_view declaration,
-                                    SourceLayout* result);
-
 std::string ValidateCacheLayout(const CacheLayout& layout);
 std::string ValidateLayoutProfile(const CacheLayout& layout,
                                   const common::ResolvedHashProfile& profile);

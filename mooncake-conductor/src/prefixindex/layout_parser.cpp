@@ -1,21 +1,22 @@
-#include "conductor/prefixindex/cache_layout.h"
+#include "conductor/prefixindex/layout_parser.h"
 
 #include <json/json.h>
 
+#include <algorithm>
 #include <memory>
 #include <set>
 #include <string>
 
 namespace mooncake::conductor::prefixindex {
 
-std::string ResolveAscendDeployment(const common::ServiceConfig& service,
-                                    std::string_view declaration,
-                                    SourceLayout* result) {
+std::string ResolveVllmDeployment(const common::ServiceConfig& service,
+                                  std::string_view declaration,
+                                  SourceLayout* result) {
     const auto* model = FindModelCacheSpec(service.model_name);
     if (!result || !model || !model->checkpoints || model->sliding_window ||
         service.publisher_kind != common::PublisherKind::kVllm ||
         service.hash_profile.strategy != "vllm_v1")
-        return "unsupported Ascend deployment/model";
+        return "unsupported vLLM deployment/model";
     if (declaration.empty() || declaration.size() > 65536)
         return "cache layout declaration must contain at most 65536 bytes";
     Json::CharReaderBuilder builder;
@@ -110,6 +111,100 @@ std::string ResolveAscendDeployment(const common::ServiceConfig& service,
     if (auto validation = ValidateCacheLayout(*layout); !validation.empty())
         return validation;
     *result = std::move(binding);
+    return "";
+}
+
+std::string ValidateVllmGroup(std::optional<int64_t> group) {
+    if (group.has_value() && *group != 0) {
+        return "only cache group zero is supported";
+    }
+    return "";
+}
+
+std::string ValidateVllmStoredAssertions(const zmq::VllmStoredEvent& event,
+                                         const common::ServiceConfig& service) {
+    if (event.block_size != service.block_size) {
+        return "block_size mismatch: expected " +
+               std::to_string(service.block_size) + ", got " +
+               std::to_string(event.block_size);
+    }
+    if (event.lora_id.has_value()) {
+        // Modern vLLM hashes the adapter name, but still publishes the legacy
+        // numeric ID. It need not match an ID on another engine. ID-only
+        // events cannot establish the name used by our query hash strategy.
+        if (*event.lora_id <= 0) {
+            return "lora_id must be positive when provided";
+        }
+        if (event.lora_name.value_or("").empty()) {
+            return "lora_name is required when lora_id is provided";
+        }
+    }
+    if (event.lora_name.value_or("") != service.lora_name) {
+        return "lora_name conflicts with trusted registration";
+    }
+    if (std::string error = ValidateVllmGroup(event.group_idx);
+        !error.empty()) {
+        return error;
+    }
+    // MLA shares the full-attention prefix lifecycle. Static sink blocks are
+    // separate from request blocks and do not participate in their events.
+    if (event.kv_cache_spec_kind.has_value() &&
+        *event.kv_cache_spec_kind != "full_attention" &&
+        *event.kv_cache_spec_kind != "mla_attention" &&
+        *event.kv_cache_spec_kind != "sink_full_attention") {
+        return "unsupported kv_cache_spec_kind assertion: " +
+               *event.kv_cache_spec_kind;
+    }
+    if (event.kv_cache_spec_sliding_window.has_value()) {
+        return "sliding-window cache specs are not supported";
+    }
+    return "";
+}
+
+std::string ValidateVllmGroupedStoredAssertions(
+    const zmq::VllmStoredEvent& event, const common::ServiceConfig& service,
+    const CacheLayout& layout, const CacheGroupLayout& group,
+    StorageTier tier) {
+    if (group.trailing_blocks > 0) {
+        const int64_t expected =
+            group.window_tokens > 0
+                ? (group.window_tokens - 1) / group.block_tokens +
+                      ((group.window_tokens - 1) % group.block_tokens != 0)
+                : -1;
+        if (expected < 0 ||
+            group.trailing_blocks != std::max<int64_t>(1, expected))
+            return "retained-page policy is not a native vLLM sliding window";
+    }
+    if (event.block_size <= 0)
+        return "placeholder event cannot prove cache residency";
+    // Native vLLM also advertises fine-grained aliases for an existing dense
+    // page. Keep their endpoint hashes; Query still accepts only complete
+    // physical-group/alignment boundaries, never the partial alias itself.
+    const bool dense_alias = tier == StorageTier::kDevice &&
+                             group.match == MatchPolicy::kDense &&
+                             event.block_size <= group.block_tokens &&
+                             event.block_size % layout.hash_unit_tokens == 0;
+    if (group.match != MatchPolicy::kCheckpoint &&
+        event.block_size != group.block_tokens && !dense_alias)
+        return "event block_size conflicts with group logical span";
+    if (event.lora_name.value_or("") != service.lora_name ||
+        (event.lora_id && (*event.lora_id <= 0 || !event.lora_name)))
+        return "event LoRA conflicts with registration";
+    if (event.kv_cache_spec_kind) {
+        const auto& kind = *event.kv_cache_spec_kind;
+        const bool accepted =
+            !group.event_kind.empty()                 ? kind == group.event_kind
+            : group.match == MatchPolicy::kCheckpoint ? kind == "mamba"
+            : group.match == MatchPolicy::kWindow
+                ? kind == "sliding_window"
+                : (kind == "full_attention" || kind == "mla_attention" ||
+                   kind == "sink_full_attention");
+        if (!accepted) return "event kind conflicts with group match policy";
+    }
+    if (event.kv_cache_spec_sliding_window &&
+        (group.match != MatchPolicy::kWindow ||
+         *event.kv_cache_spec_sliding_window != group.window_tokens))
+        return "event window conflicts with layout";
     return "";
 }
 

@@ -72,7 +72,7 @@ struct ContextState {
     const size_t max_blocks;
     // Cumulative number of entries removed by capacity eviction.
     int64_t evicted_by_capacity = 0;
-    // Allocated only for contexts bound to an explicit special-KV layout.
+    // Allocated only for contexts requiring grouped KV matching.
     std::shared_ptr<HybridIndex> hybrid;
 };
 

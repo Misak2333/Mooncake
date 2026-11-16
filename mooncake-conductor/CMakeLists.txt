@@ -61,7 +61,7 @@ add_library(
   src/client/conductor_c.cpp
   src/prefixindex/hash_strategy.cpp
   src/prefixindex/cache_layout.cpp
-  src/prefixindex/ascend_layout.cpp
+  src/prefixindex/layout_parser.cpp
   src/prefixindex/hybrid_index.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
