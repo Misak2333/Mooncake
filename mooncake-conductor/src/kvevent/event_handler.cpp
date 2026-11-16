@@ -127,6 +127,8 @@ std::string NormalizeExternalHash(const zmq::ExternalHash& external_hash,
     return "";
 }
 
+}  // namespace
+
 std::string NormalizeExternalHashes(
     const std::vector<zmq::ExternalHash>& external_hashes,
     std::vector<prefixindex::ProjectedPrefix>* output) {
@@ -144,6 +146,8 @@ std::string NormalizeExternalHashes(
     *output = std::move(normalized);
     return "";
 }
+
+namespace {
 
 int HexNibble(char character) {
     if (character >= '0' && character <= '9') {
@@ -274,8 +278,121 @@ size_t HashCount(const Event& event) {
 
 }  // namespace
 
-KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc)
-    : manager_(manager), service_(std::move(svc)) {}
+KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
+                               prefixindex::SourceLayout layout)
+    : manager_(manager),
+      service_(std::move(svc)),
+      layout_(std::move(layout)),
+      grouped_context_(layout_.layout != nullptr) {}
+
+std::string KVEventHandler::QueuePending(const zmq::DecodedBatch& batch,
+                                         const zmq::MessageMetadata& metadata) {
+    const size_t count =
+        std::visit([](const auto& item) { return item.events.size(); }, batch);
+    const size_t bytes =
+        std::visit(
+            [](const auto& item) {
+                size_t total = sizeof(item);
+                for (const auto& decoded : item.events) {
+                    total += sizeof(decoded) + decoded.error.size();
+                    if (!decoded.ok()) continue;
+                    total += std::visit(
+                        [](const auto& event) {
+                            size_t size = sizeof(event);
+                            if constexpr (requires { event.block_hashes; }) {
+                                size += event.block_hashes.size() *
+                                        sizeof(event.block_hashes[0]);
+                                if constexpr (std::is_same_v<
+                                                  std::decay_t<decltype(event)>,
+                                                  zmq::VllmStoredEvent> ||
+                                              std::is_same_v<
+                                                  std::decay_t<decltype(event)>,
+                                                  zmq::VllmRemovedEvent>) {
+                                    for (const auto& hash : event.block_hashes)
+                                        if (const auto* binary = std::get_if<
+                                                std::vector<uint8_t>>(&hash))
+                                            size += binary->size();
+                                }
+                            }
+                            if constexpr (requires { event.token_ids; })
+                                if (event.token_ids)
+                                    size += event.token_ids->size() *
+                                            sizeof(int32_t);
+                            if constexpr (requires { event.kv_cache_layout; })
+                                if (event.kv_cache_layout)
+                                    size += event.kv_cache_layout->size();
+                            if constexpr (requires { event.fields; }) {
+                                size += event.fields.backend_id.size() +
+                                        event.fields.tenant_id.size();
+                                for (const auto* text :
+                                     {&event.fields.model_name,
+                                      &event.fields.lora_name,
+                                      &event.fields.additional_salt,
+                                      &event.fields.medium})
+                                    if (*text) size += text->value().size();
+                            }
+                            if constexpr (requires { event.object; }) {
+                                for (const auto* text :
+                                     {&event.object.object_key,
+                                      &event.object.group_id,
+                                      &event.object.connector_block_hash,
+                                      &event.object.cache_prefix})
+                                    if (*text) size += text->value().size();
+                                size += event.object.seq_hashes.size() *
+                                        sizeof(uint64_t);
+                                if (event.object.legacy_block_hashes)
+                                    size += event.object.legacy_block_hashes
+                                                ->size() *
+                                            sizeof(uint64_t);
+                            }
+                            return size;
+                        },
+                        *decoded.event);
+                }
+                return total;
+            },
+            batch) +
+        metadata.endpoint.size() + metadata.topic.size();
+    // Bounded startup buffering, never silent loss: overflow quarantines the
+    // source until it is explicitly resynchronized/re-registered.
+    if (count > 4096 - pending_event_count_ || pending_.size() >= 256 ||
+        bytes > 64 * 1024 * 1024 - pending_bytes_) {
+        pending_.clear();
+        pending_event_count_ = 0;
+        pending_bytes_ = 0;
+        MarkUnavailable();
+        return "deployment startup buffer exceeded; source must resynchronize";
+    }
+    pending_.emplace_back(batch, metadata);
+    pending_event_count_ += count;
+    pending_bytes_ += bytes;
+    return "";
+}
+
+void KVEventHandler::DrainPending() {
+    auto pending = std::move(pending_);
+    pending_.clear();
+    pending_event_count_ = 0;
+    pending_bytes_ = 0;
+    for (const auto& [batch, metadata] : pending) {
+        if (const auto* vllm = std::get_if<zmq::VllmEventBatch>(&batch))
+            HandleVllmBatch(*vllm, metadata);
+        else if (const auto* store =
+                     std::get_if<zmq::MooncakeEventBatch>(&batch))
+            HandleMooncakeBatch(*store, metadata);
+    }
+}
+
+void KVEventHandler::RefreshDeployment() {
+    if (!grouped_context_ || !BeginDispatch()) return;
+    DispatchLease lease(this);
+    std::lock_guard lock(grouped_dispatch_mu_);
+    if (manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
+                                              &layout_)) {
+        layout_.source = prefixindex::LayoutSource::kMooncake;
+        DrainPending();
+    }
+}
 
 bool KVEventHandler::BeginDispatch() {
     std::lock_guard lock(lifecycle_mu_);
@@ -319,6 +436,8 @@ std::string KVEventHandler::HandleBatch(const zmq::DecodedBatch& batch,
     if (metadata.endpoint != service_.endpoint) {
         return "message endpoint conflicts with trusted registration";
     }
+    std::unique_lock<std::mutex> grouped_lock;
+    if (grouped_context_) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
     if (service_.publisher_kind == common::PublisherKind::kVllm) {
         const auto* vllm_batch = std::get_if<zmq::VllmEventBatch>(&batch);
         if (vllm_batch == nullptr) {
@@ -375,6 +494,36 @@ std::string KVEventHandler::HandleVllmBatch(
                      << " seq=" << metadata.sequence;
         return "batch data_parallel_rank conflicts with trusted registration";
     }
+    if (grouped_context_) {
+        for (const auto& decoded : batch.events) {
+            if (!decoded.ok()) continue;
+            const auto* stored =
+                std::get_if<zmq::VllmStoredEvent>(&*decoded.event);
+            if (!stored || !stored->kv_cache_layout ||
+                *stored->kv_cache_layout == deployment_declaration_)
+                continue;
+            prefixindex::SourceLayout binding;
+            if (auto error = prefixindex::ResolveAscendDeployment(
+                    service_, *stored->kv_cache_layout, &binding);
+                !error.empty())
+                return error;
+            if (auto error = manager_->GetIndexer()->ActivateDeployment(
+                    ContextFromService(service_), service_.hash_profile,
+                    binding, service_.instance_id, service_.dp_rank);
+                !error.empty())
+                return error;
+            layout_ = std::move(binding);
+            deployment_declaration_ = *stored->kv_cache_layout;
+            LOG(INFO) << "Activated complete cache deployment model="
+                      << service_.model_name
+                      << " instance=" << service_.instance_id
+                      << " groups=" << layout_.layout->groups.size();
+            manager_->RefreshMooncakeDeployments(ContextFromService(service_));
+        }
+    }
+    if (layout_.layout && !layout_.layout->unavailable_reason.empty())
+        return QueuePending(batch, metadata);
+    if (!pending_.empty()) DrainPending();
 
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
@@ -423,6 +572,8 @@ std::string KVEventHandler::HandleSglangBatch(
         *batch.data_parallel_rank != service_.dp_rank) {
         return "batch data_parallel_rank conflicts with trusted registration";
     }
+    if (layout_.layout && !layout_.layout->unavailable_reason.empty())
+        return "";
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
@@ -455,6 +606,7 @@ std::string KVEventHandler::HandleSglangBatch(
 
 std::string KVEventHandler::HandleSglangStored(
     const zmq::SglangStoredEvent& event, const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedSglangStored(event);
     if (event.block_size <= 0 || event.block_size > service_.block_size) {
         return "block_size must be in the range [1, " +
                std::to_string(service_.block_size) + "], got " +
@@ -500,6 +652,7 @@ std::string KVEventHandler::HandleSglangStored(
 std::string KVEventHandler::HandleSglangRemoved(
     const zmq::SglangRemovedEvent& event,
     const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedSglangRemoved(event);
     std::vector<prefixindex::ProjectedPrefix> prefixes;
     prefixes.reserve(event.block_hashes.size());
     for (uint64_t hash : event.block_hashes) {
@@ -722,6 +875,13 @@ std::string KVEventHandler::HandleSglangMooncakeRemoved(
 std::string KVEventHandler::HandleMooncakeBatch(
     const zmq::MooncakeEventBatch& batch,
     const zmq::MessageMetadata& metadata) {
+    if (layout_.layout && !layout_.layout->unavailable_reason.empty()) {
+        if (!manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
+                                                   &layout_))
+            return QueuePending(batch, metadata);
+        layout_.source = prefixindex::LayoutSource::kMooncake;
+    }
+    if (!pending_.empty()) DrainPending();
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
@@ -772,6 +932,7 @@ std::string KVEventHandler::HandleMooncakeBatch(
 
 std::string KVEventHandler::HandleVllmStored(
     const zmq::VllmStoredEvent& event, const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedVllmStored(event);
     if (std::string error = ValidateVllmStoredAssertions(event, service_);
         !error.empty()) {
         return error;
@@ -807,6 +968,7 @@ std::string KVEventHandler::HandleVllmStored(
 
 std::string KVEventHandler::HandleVllmRemoved(
     const zmq::VllmRemovedEvent& event, const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedVllmRemoved(event);
     if (std::string error = ValidateVllmGroup(event.group_idx);
         !error.empty()) {
         return error;
@@ -860,6 +1022,7 @@ std::string KVEventHandler::HandleVllmCleared(
 std::string KVEventHandler::HandleMooncakeStored(
     const zmq::MooncakeStoredEvent& event,
     const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedMooncakeStored(event);
     if (service_.hash_profile.strategy == "sglang" ||
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeStored(event, metadata);
@@ -982,6 +1145,7 @@ std::string KVEventHandler::HandleMooncakeStored(
 std::string KVEventHandler::HandleMooncakeRemoved(
     const zmq::MooncakeRemovedEvent& event,
     const zmq::MessageMetadata& metadata) {
+    if (layout_.layout) return HandleGroupedMooncakeRemoved(event);
     if (service_.hash_profile.strategy == "sglang" ||
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeRemoved(event, metadata);
@@ -1100,6 +1264,12 @@ std::string KVEventHandler::HandleMooncakeCleared(
 std::string KVEventHandler::ClearMooncakeBindings(
     const std::optional<std::string>& backend_id,
     const std::optional<std::string>& tenant_id) {
+    if (layout_.layout) {
+        if (tenant_id && *tenant_id != service_.tenant_id)
+            return "clear tenant conflicts with registration";
+        return manager_->GetIndexer()->ClearGroupedSource(
+            ContextFromService(service_), service_.endpoint, backend_id);
+    }
     std::lock_guard lock(bindings_mu_);
     for (auto binding = pool_bindings_.begin();
          binding != pool_bindings_.end();) {
@@ -1129,6 +1299,10 @@ std::string KVEventHandler::ClearMooncakeBindings(
 
 std::string KVEventHandler::InvalidateEndpoint() {
     MarkUnavailable();
+    std::unique_lock<std::mutex> grouped_lock;
+    if (grouped_context_) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
+    pending_.clear();
+    pending_event_count_ = pending_bytes_ = 0;
     if (service_.publisher_kind == common::PublisherKind::kVllm ||
         service_.publisher_kind == common::PublisherKind::kSglang) {
         return manager_->GetIndexer()->ClearEngine({

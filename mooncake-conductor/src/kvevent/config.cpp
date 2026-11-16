@@ -152,6 +152,12 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
         }
     }
 
+    if (cfg.isMember("cache_layouts") || cfg.isMember("layout_bindings")) {
+        LOG(ERROR) << "cache_layouts/layout_bindings are no longer supported; "
+                      "cache rules are selected from the registered modelname";
+        std::exit(1);
+    }
+
     // An absent http_server_port field leaves the port as 0.
     *http_server_port =
         cfg.isMember("http_server_port") && cfg["http_server_port"].isNumeric()

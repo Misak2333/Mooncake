@@ -3381,6 +3381,25 @@ TEST(ParseConfigDeathTest, InvalidMaxBlocksPerContextExits) {
     std::remove(path.c_str());
 }
 
+TEST(ParseConfigDeathTest, RejectsExternalModelLayoutRules) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_external_layout.json";
+    int port = 0;
+    int rpc_port = 0;
+    for (const char* field : {"cache_layouts", "layout_bindings"}) {
+        {
+            std::ofstream out(path);
+            out << "{\"" << field << "\":{}}";
+        }
+        guard.SetPath(path);
+        EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port),
+                    ::testing::ExitedWithCode(1), "");
+    }
+    std::remove(path.c_str());
+}
+
 // Real upstream msgspec bytes and hashes traverse ZMQ, the handler and HTTP.
 // This tests the event-to-query contract without starting an inference engine.
 class RealZmqPublisher {
